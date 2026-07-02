@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tos-exec"
+version = "0.1.0"
+description = "Ejecucion de opciones en thinkorswim web Paper Money: ordenes por WebSocket, executor con webview y gestion de salidas por prima."
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12",
+    "certifi",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# Solo hace falta para la ventana del executor (webview Qt + auto-login).
+# El cliente HTTP (tos.client) y el cliente WS (tos.ws_client) no lo necesitan.
+app = [
+    "PySide6>=6.6",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+tos-executor = "tos.executor_app:main"
+
+[tool.setuptools]
+packages = ["tos"]
