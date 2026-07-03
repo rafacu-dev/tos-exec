@@ -5,7 +5,7 @@ por la prima del contrato. Los imports pesados (PySide6) se resuelven de forma
 perezosa: `tos.client` y `tos.ws_client` funcionan sin Qt instalado.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "TosAlert",
