@@ -7,6 +7,12 @@ Paper Money y gestiona la salida por la prima del contrato (ver contract_exit).
 Los datos del proyecto (precio del subyacente, seleccion de contrato, prima de
 la opcion) llegan por `tos.hooks`; sin hooks, la alerta debe traer entry_price,
 strike y expiration, y no hay gestion de salida por prima.
+
+Sin dependencia de UI ni de Qt: el host recibe eventos por callbacks (on_log,
+on_position_changed) y puede sondear con su propio timer (check_prices) o con
+el hilo interno (start). Si se usa la automatizacion DOM de tos.automation
+(Qt), el host debe llamar submit_alert/check_prices desde el hilo de Qt; la
+ruta WebSocket (la normal) es thread-safe.
 """
 from __future__ import annotations
 
@@ -17,8 +23,6 @@ import json
 import threading
 import uuid
 from typing import Callable
-
-from PySide6.QtCore import QObject, QTimer, Signal
 
 from tos import hooks
 from tos.paths import data_dir
@@ -205,41 +209,61 @@ def contract_exit(pos: dict, premium: float) -> dict:
     return {"fields": fields, "reason": reason}
 
 
-class TosTradeManager(QObject):
-    """Conecta alertas LocalQuantAI -> TOS -> gestion trailing por precio."""
+class TosTradeManager:
+    """Conecta alertas del proyecto anfitrion -> TOS -> gestion por prima.
 
-    log = Signal(str)
-    position_changed = Signal(dict)
+    `automation` (opcional) es el ejecutor DOM de tos.automation; si expone la
+    senal Qt `order_result`, se conecta sola a handle_order_result. La ruta
+    principal es `ws_runtime` (ordenes por WebSocket, sin Qt).
+    """
 
     def __init__(
         self,
-        automation,
+        automation=None,
         store: ManagedPositionStore | None = None,
         price_fn: Callable[[str], tuple[float, str]] | None = None,
-        poll_ms: int = 20000,
+        poll_seconds: float = 20.0,
         ws_runtime=None,
-        parent=None,
+        on_log: Callable[[str], None] | None = None,
+        on_position_changed: Callable[[dict], None] | None = None,
     ):
-        super().__init__(parent)
         self.automation = automation
         self.ws_runtime = ws_runtime
         self.store = store or ManagedPositionStore()
         self._price_fn = price_fn
+        self.poll_seconds = float(poll_seconds)
+        self.on_log = on_log or (lambda msg: None)
+        self.on_position_changed = on_position_changed or (lambda pos: None)
         self._warned_no_premium = False
+        self._lock = threading.RLock()
         self._queue: list[dict] = []
         self._active_request: dict | None = None
-        self.timer = QTimer(self)
-        self.timer.setInterval(poll_ms)
-        self.timer.timeout.connect(self.check_prices)
-        self.automation.order_result.connect(self._on_order_result)
+        self._stop_event = threading.Event()
+        self._poll_thread: threading.Thread | None = None
+        if automation is not None and hasattr(automation, "order_result"):
+            automation.order_result.connect(self.handle_order_result)
 
     def start(self):
-        if not self.timer.isActive():
-            self.timer.start()
-            self._emit("Monitor TOS iniciado: revisa precios cada 60s.")
+        """Sondeo con hilo interno. Un host Qt que use la automatizacion DOM
+        debe preferir su propio timer llamando check_prices()."""
+        if self._poll_thread and self._poll_thread.is_alive():
+            return
+        self._stop_event.clear()
+
+        def loop():
+            while not self._stop_event.wait(self.poll_seconds):
+                try:
+                    self.check_prices()
+                except Exception as exc:
+                    self._emit(f"check_prices fallo: {exc}")
+
+        self._poll_thread = threading.Thread(target=loop, daemon=True)
+        self._poll_thread.start()
+        self._emit(f"Monitor TOS iniciado: revisa precios cada {self.poll_seconds:.0f}s.")
 
     def stop(self):
-        self.timer.stop()
+        self._stop_event.set()
+        self._poll_thread = None
         self._emit("Monitor TOS detenido.")
 
     def get_price(self, symbol: str) -> tuple[float, str]:
@@ -309,13 +333,13 @@ class TosTradeManager(QObject):
                                                 pos.get("close_order_result") or {"ok": True, "via": "verified"})
                 if closed:
                     self._emit(f"✓ Cierre CONFIRMADO en broker: {pos['symbol']} {pos['direction']} {pos['strike']}.")
-                    self.position_changed.emit(closed)
+                    self.on_position_changed(closed)
             elif _seconds_since(pos.get("closing_requested_at")) >= CLOSE_GRACE_SEC:
                 reopened = self.store.update(pos["id"], status="open",
                                              last_error="cierre no ejecutó en el broker; reintentando")
                 if reopened:
                     self._emit(f"⚠️ Cierre NO ejecutó: {pos['symbol']} {pos['strike']} sigue en la cuenta → reintentando.")
-                    self.position_changed.emit(reopened)
+                    self.on_position_changed(reopened)
 
     def _reconcile_with_broker(self, held):
         """Marca cerradas las posiciones que ya NO están en la cuenta TOS (cerradas
@@ -339,7 +363,7 @@ class TosTradeManager(QObject):
                                        {"ok": True, "via": "reconcile"})
                 changed = next((p for p in self.store.all() if p.get("id") == pos["id"]), None)
                 if changed:
-                    self.position_changed.emit(changed)
+                    self.on_position_changed(changed)
                 pnl_txt = f" P&L≈{changed.get('option_pnl_pct'):+.0f}%" if changed and changed.get("option_pnl_pct") else ""
                 self._emit(f"Reconciliado: {pos['symbol']} {pos['direction']} "
                            f"{pos['strike']} cerrada manualmente en TOS.{pnl_txt}")
@@ -382,7 +406,7 @@ class TosTradeManager(QObject):
             out = contract_exit(pos, premium)
             changed = self.store.update(pos["id"], **out["fields"])
             if changed:
-                self.position_changed.emit(changed)
+                self.on_position_changed(changed)
             if out["reason"]:
                 # cooldown: no re-disparar un cierre si ya se intentó hace poco (evita
                 # spam de órdenes mientras se confirma/reintenta el cierre anterior).
@@ -402,11 +426,12 @@ class TosTradeManager(QObject):
         return True
 
     def _enqueue(self, req: dict):
-        if self._active_request or getattr(self.automation, "busy", False):
-            self._queue.append(req)
-            self._emit(f"Solicitud TOS en cola ({req['type']}).")
-            return
-        self._send(req)
+        with self._lock:
+            if self._active_request or getattr(self.automation, "busy", False):
+                self._queue.append(req)
+                self._emit(f"Solicitud TOS en cola ({req['type']}).")
+                return
+            self._send(req)
 
     def _ws_available(self) -> bool:
         return self.ws_runtime is not None and self.ws_runtime.token_status() is not None
@@ -432,11 +457,12 @@ class TosTradeManager(QObject):
                            "via": "ws", "detail": "" if good else "SUBMIT sin orderId"}
             except Exception as exc:
                 res = {"ok": False, "state": "WS_ERROR", "detail": str(exc), "via": "ws"}
-            self.automation.order_result.emit(res)
+            self.handle_order_result(res)
         threading.Thread(target=job, daemon=True).start()
 
     def _send(self, req: dict):
-        self._active_request = req
+        with self._lock:
+            self._active_request = req
         via_ws = self._ws_available()
         if req["type"] == "entry":
             alert: TosAlert = req["alert"]
@@ -448,6 +474,9 @@ class TosTradeManager(QObject):
                 self._ws_order_async(alert.symbol, alert.direction, float(alert.strike),
                                      str(alert.expiration), int(alert.quantity),
                                      bool(alert.submit), is_entry=True)
+                return
+            if self.automation is None:
+                self._fail_no_executor(req)
                 return
             ok = self.automation.buy_option(
                 alert.symbol,
@@ -468,6 +497,9 @@ class TosTradeManager(QObject):
                                      str(pos["expiration"]), -int(pos.get("quantity") or 1),
                                      True, is_entry=False)
                 return
+            if self.automation is None:
+                self._fail_no_executor(req)
+                return
             ok = self.automation.sell_option(
                 pos["symbol"],
                 pos["direction"],
@@ -479,12 +511,26 @@ class TosTradeManager(QObject):
         if not ok:
             if req["type"] == "exit":
                 self.store.mark_open_error(req["position"]["id"], "automation busy/rejected")
-            self._active_request = None
+            with self._lock:
+                self._active_request = None
             self._drain_queue()
 
-    def _on_order_result(self, res: dict):
-        req = self._active_request
-        self._active_request = None
+    def _fail_no_executor(self, req: dict):
+        """Ni token WS valido ni automation DOM: la orden no puede salir."""
+        self._emit("⚠️ Orden rechazada: sin token WS válido y sin automation DOM.")
+        if req["type"] == "exit":
+            self.store.update(req["position"]["id"], status="open",
+                              last_error="sin ejecutor (WS/DOM) disponible")
+        with self._lock:
+            self._active_request = None
+        self._drain_queue()
+
+    def handle_order_result(self, res: dict):
+        """Resultado de una orden (WS o DOM). La automation Qt se conecta sola
+        via su senal order_result; un ejecutor propio debe llamarlo al terminar."""
+        with self._lock:
+            req = self._active_request
+            self._active_request = None
         if not req:
             self._drain_queue()
             return
@@ -517,7 +563,7 @@ class TosTradeManager(QObject):
                     "entry_order_result": res,
                 })
                 self._emit(f"Posicion gestionada abierta: {pos['id']} {pos['symbol']}.")
-                self.position_changed.emit(pos)
+                self.on_position_changed(pos)
             else:
                 self._emit(f"Entrada no registrada: {state} {res.get('detail', '')}")
         else:
@@ -538,9 +584,14 @@ class TosTradeManager(QObject):
         self._drain_queue()
 
     def _drain_queue(self):
-        if self._queue and not getattr(self.automation, "busy", False):
+        with self._lock:
+            if not self._queue or getattr(self.automation, "busy", False):
+                return
             nxt = self._queue.pop(0)
-            QTimer.singleShot(250, lambda: self._send(nxt))
+        threading.Timer(0.25, lambda: self._send(nxt)).start()
 
     def _emit(self, msg: str):
-        self.log.emit(msg)
+        try:
+            self.on_log(str(msg))
+        except Exception:
+            pass
