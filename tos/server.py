@@ -1,17 +1,21 @@
 """Receptor HTTP local de alertas: metodos puros, sin UI ni Qt.
 
-Expone el mismo API que consumia el scanner:
+Expone API local para integraciones:
 
 - POST /alert     recibe una alerta y manda la orden de entrada.
 - POST /close     cierra por id / alert_id / simbolo.
+- POST /buy       compra directa por WebSocket (API v1.2, sin gestion).
+- POST /sell      vende directa por WebSocket (API v1.2, sin gestion).
+- POST /auto_exit salida automatica por porcentaje sobre posiciones abiertas.
 - POST /ws_order  orden directa por WebSocket (prueba; submit=false = review).
-- GET  /positions posiciones gestionadas.
+- GET  /positions posiciones abiertas (broker si no hay manager; legado si hay manager).
+- GET  /day_summary resumen del dia con P/L disponible/calculado.
 - GET  /logs      ultimas lineas de log.
 - GET  /ws_status estado del token WS.
 
-Uso directo (thread-safe con la ruta WS):
+Uso directo v1.2 (thread-safe con la ruta WS):
 
-    server = TosHttpServer(manager, port=5060, ws_runtime=rt)
+    server = TosHttpServer(port=5060, ws_runtime=rt)
     server.start()
 
 Un host Qt que use la automatizacion DOM debe pasar `on_alert`/`on_close` para
@@ -52,6 +56,19 @@ def resolve_position_id(store, payload: dict) -> str:
     return ""
 
 
+def _order_payload(payload: dict) -> dict:
+    return {
+        "root": str(payload.get("symbol") or payload.get("root") or "").upper(),
+        "expiration": str(payload["expiration"]),
+        "side": str(payload.get("direction") or payload.get("side") or "").upper(),
+        "strike": float(payload["strike"]),
+        "quantity": int(payload.get("quantity", 1)),
+        "order_type": str(payload.get("order_type", "MARKET")).upper(),
+        "limit_price": payload.get("limit_price"),
+        "submit": bool(payload.get("submit", True)),
+    }
+
+
 def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                  on_alert: Callable[[dict], None] | None = None,
                  on_close: Callable[[str, str], None] | None = None):
@@ -64,7 +81,34 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
         def do_GET(self):
             path = self.path.rstrip("/")
             if path == "/positions":
+                if manager is None and ws_runtime is not None:
+                    try:
+                        _json_response(self, 200, {"ok": True, "positions": ws_runtime.open_option_positions()})
+                    except Exception as exc:
+                        _json_response(self, 400, {"ok": False, "error": str(exc)})
+                    return
+                if manager is None:
+                    _json_response(self, 400, {"ok": False, "error": "manager no activo"})
+                    return
                 _json_response(self, 200, {"ok": True, "positions": manager.store.all()})
+                return
+            if path == "/broker_positions":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    _json_response(self, 200, {"ok": True, "positions": ws_runtime.open_option_positions()})
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if path == "/day_summary":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    _json_response(self, 200, ws_runtime.day_summary())
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
             if path == "/logs":
                 _json_response(self, 200, {"ok": True, "logs": list(logs[-200:])})
@@ -86,6 +130,9 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
 
             path = self.path.rstrip("/")
             if path == "/alert":
+                if manager is None:
+                    _json_response(self, 400, {"ok": False, "error": "manager no activo"})
+                    return
                 if on_alert is not None:
                     on_alert(payload)
                     _json_response(self, 202, {"ok": True, "accepted": True})
@@ -97,6 +144,9 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                     _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
             if path == "/close":
+                if manager is None:
+                    _json_response(self, 400, {"ok": False, "error": "manager no activo"})
+                    return
                 pos_id = resolve_position_id(manager.store, payload)
                 if not pos_id:
                     _json_response(self, 404, {"ok": False, "error":
@@ -108,6 +158,42 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                 else:
                     manager.request_close(pos_id, reason)
                 _json_response(self, 202, {"ok": True, "accepted": True})
+                return
+            if path == "/buy":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    args = _order_payload(payload)
+                    res = ws_runtime.buy_option(**args)
+                    _json_response(self, 200, {"ok": True, "result": res})
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if path == "/sell":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    args = _order_payload(payload)
+                    res = ws_runtime.sell_option(**args)
+                    _json_response(self, 200, {"ok": True, "result": res})
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if path == "/auto_exit":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    res = ws_runtime.auto_exit_percent(
+                        take_profit_pct=payload.get("take_profit_pct"),
+                        stop_loss_pct=payload.get("stop_loss_pct"),
+                        submit=bool(payload.get("submit", True)),
+                        dry_run=bool(payload.get("dry_run", False)))
+                    _json_response(self, 200, res)
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
             if path == "/ws_order":
                 if ws_runtime is None:
@@ -135,7 +221,7 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
 class TosHttpServer:
     """ThreadingHTTPServer en un hilo demonio, con start()/stop()."""
 
-    def __init__(self, manager, port: int = 5060, host: str = "127.0.0.1",
+    def __init__(self, manager=None, port: int = 5060, host: str = "127.0.0.1",
                  ws_runtime=None, log_lines: list[str] | None = None,
                  on_alert: Callable[[dict], None] | None = None,
                  on_close: Callable[[str, str], None] | None = None):
@@ -156,4 +242,7 @@ class TosHttpServer:
         self._thread.start()
 
     def stop(self):
-        self.httpd.shutdown()
+        if self._thread and self._thread.is_alive():
+            self.httpd.shutdown()
+            self._thread.join(timeout=2)
+        self.httpd.server_close()

@@ -1,124 +1,204 @@
 # tos-exec
 
-Libreria independiente para ejecutar opciones en **thinkorswim web Paper Money**.
-**Solo metodos, sin UI**: la interfaz (ventana, webview, botones) la implementa
-cada sistema que la instala. Es la unica copia a mantener: cada proyecto la
-instala y le inyecta sus propias fuentes de datos via `tos.hooks`.
+Version actual: **1.2.0**.
+
+Libreria independiente para interactuar con **thinkorswim web Paper Money**
+mediante el gateway WebSocket de Schwab. No trae UI propia: el proyecto host
+crea el webview, guarda/renueva la sesion y llama estos metodos.
+
+## Proposito de v1.2
+
+La API recomendada de esta version es deliberadamente pequena y explicita:
+
+- `WsRuntime.buy_option(...)`: compra contratos de opcion por WebSocket.
+- `WsRuntime.sell_option(...)`: vende contratos de opcion por WebSocket.
+- `WsRuntime.auto_exit_percent(...)`: revisa posiciones abiertas y vende cuando
+  una posicion alcanza el porcentaje configurado de ganancia o perdida.
+- `WsRuntime.open_option_positions(...)`: devuelve posiciones OPTION abiertas.
+- `WsRuntime.day_summary(...)`: devuelve resumen del dia/P&L disponible.
+
+La libreria no debe decidir estrategias ni seleccionar entradas. Solo ejecuta
+compras/ventas explicitas y, si el host lo pide, una salida automatica por
+porcentaje configurable.
+
+Los modulos historicos de alertas/gestion siguen en el paquete para no romper
+instalaciones existentes, pero quedan como **legado** para integraciones nuevas.
 
 ## Instalacion
 
 ```bash
-# nucleo (WS + gestion + receptor HTTP + cliente, sin Qt):
+# nucleo WebSocket, sin Qt:
 pip install "tos-exec @ git+https://github.com/<usuario>/tos-exec.git"
 
-# con los helpers Qt (automation DOM / captura WS en un webview del host):
+# con helpers Qt para webview, auto-login y captura CDP:
 pip install "tos-exec[qt] @ git+https://github.com/<usuario>/tos-exec.git"
 
-# desarrollo local (repo hermano):
+# desarrollo local:
 pip install -e '../tos-exec[qt]'
 ```
 
 El paquete importable se llama `tos`.
 
-## Que trae (todo son metodos/clases)
-
-| Modulo | Que hace | Qt |
-|---|---|---|
-| `tos.ws_client` | Cliente WebSocket del gateway WsJson de Schwab: login por token, cuentas, posiciones, ordenes CONFIRM→SUBMIT, safeguard anti-short | no |
-| `tos.ws_runtime` | Loop asyncio en un hilo: captura de token via CDP + `place_option()` / `held_option_symbols()` thread-safe | no |
-| `tos.alerts` | `TosTradeManager`: recibe alertas, coloca la entrada y gestiona la salida por prima (+10% trail / -20% stop); reconcilia contra el broker. Callbacks `on_log` / `on_position_changed` | no |
-| `tos.server` | `TosHttpServer`: receptor HTTP (`/alert`, `/close`, `/positions`, `/ws_order`, `/ws_status`, `/logs`) | no |
-| `tos.client` | Cliente para mandar alertas a un receptor (`send_alert`, `send_close`, `positions`) | no |
-| `tos.token_store` / `tos.ws_token_capture` | Persistencia del token de sesion (~8h) y captura automatica desde el webview del host via CDP | no |
-| `tos.hooks` | Inyeccion de datos del proyecto (precio, contrato, prima) | no |
-| `tos.credentials` | Usuario/clave en macOS Keychain | no |
-| `tos.automation` + `tos.tos_scripts` | Fallback DOM: auto-login Paper Money y ordenes clicando el DOM de un `QWebEnginePage` que crea el HOST | si (`[qt]`) |
-
-## Lo que pone cada sistema (la interfaz)
-
-El host crea su propia ventana/webview donde el usuario hace login en
-`trade.thinkorswim.com` (con `QTWEBENGINE_REMOTE_DEBUGGING=9333` para que la
-captura de token via CDP funcione) y conecta las piezas:
+## Uso recomendado
 
 ```python
-from tos.alerts import TosTradeManager
-from tos.server import TosHttpServer
 from tos.ws_runtime import WsRuntime
 
 ws = WsRuntime(cdp_port=9333, log=print)
-ws.start()                                  # captura token + ordenes por WS
+ws.start()
 
-manager = TosTradeManager(
-    ws_runtime=ws,
-    on_log=print,                           # la UI decide como mostrarlo
-    on_position_changed=mi_refresco_ui,
+buy = ws.buy_option(
+    root="SPY",
+    expiration="2026-07-17",
+    side="CALL",
+    strike=625,
+    quantity=1,
+    submit=True,
 )
-manager.start()                             # sondeo interno (o llama
-                                            # manager.check_prices() con tu timer)
 
-server = TosHttpServer(manager, port=5060, ws_runtime=ws)
-server.start()                              # POST /alert desde el scanner
+sell = ws.sell_option(
+    root="SPY",
+    expiration="2026-07-17",
+    side="CALL",
+    strike=625,
+    quantity=1,
+    submit=True,
+)
 ```
 
-Notas de hilos: la ruta WebSocket es thread-safe. Si ademas usas el fallback
-DOM (`tos.automation`), llama `submit_alert` / `check_prices` desde el hilo de
-Qt (timer propio + señales) y pasa `on_alert`/`on_close` a `TosHttpServer`
-para reencolar los requests en tu hilo.
+`sell_option()` mantiene el safeguard anti-short: si la cuenta no tiene una
+posicion long de ese contrato, no envia una venta en descubierto.
 
-## Hooks: datos del proyecto
+## Salida automatica por porcentaje
+
+La salida automatica se ejecuta como una revision explicita. No abre posiciones
+ni selecciona estrategia; solo revisa posiciones OPTION abiertas y vende las que
+alcancen el porcentaje configurado.
 
 ```python
-from tos import hooks
-
-hooks.configure(
-    price=mi_precio,              # (symbol) -> (precio, ts_iso)
-    select_contract=mi_selector,  # (symbol, direction, strategy=, budget=) ->
-                                  #   {"strike","expiration","cost","delta","reason"}
-    option_premium=mi_prima,      # (symbol, expiration, direction, strike) -> float|None
+result = ws.auto_exit_percent(
+    take_profit_pct=15,   # vende si P/L% >= +15
+    stop_loss_pct=20,     # vende si P/L% <= -20
+    submit=True,
 )
 ```
 
-Tambien por entorno: `TOS_HOOKS_MODULE=<modulo>` + `tos.hooks.load_from_env()`.
-Sin hooks la libreria opera igual, pero las alertas deben traer `entry_price`,
-`strike` y `expiration`, y no hay gestion de salida por prima.
+Para probar sin enviar orden:
 
-## Datos (token, posiciones)
+```python
+preview = ws.auto_exit_percent(take_profit_pct=15, stop_loss_pct=20, dry_run=True)
+```
 
-Estado vivo en `~/.tos-exec/` (cambiable con `TOS_DATA_DIR`): `ws_token.json`,
-`managed_positions.json`. Nunca dentro del paquete ni en un repo.
+El P/L% se calcula con los campos que devuelva TOS (`AVERAGE_PRICE` /
+`OPEN_PRICE` y `MARK` / `LAST`). Si TOS no entrega datos suficientes para una
+posicion, esa posicion se reporta como `skip` y no se vende a ciegas.
 
-## Formato de alerta
+## Posiciones y resumen del dia
+
+```python
+positions = ws.open_option_positions()
+summary = ws.day_summary()
+```
+
+`open_option_positions()` devuelve cada posicion abierta enriquecida con
+cantidad, precio de entrada, mark, P/L abierto, P/L del dia si TOS lo entrega,
+y raw broker data. `day_summary()` suma lo disponible y conserva la lista de
+posiciones para inspeccion.
+
+## Auto-login obligatorio
+
+El token WebSocket vive fuera del repo, en `~/.tos-exec/ws_token.json`, y vence
+aproximadamente a las 8 horas. En v1.2, cuando un metodo de orden detecta que
+el token no existe o vencio, debe dispararse auto-login automaticamente desde
+el host.
+
+Como `tos-exec` no crea la UI, el auto-login se inyecta como callback:
+
+```python
+from tos.ws_runtime import WsRuntime
+
+def auto_login():
+    # En un host Qt, normalmente emite una senal al hilo de UI y llama:
+    # automation.ensure_logged_in_paper(username, password)
+    trigger_tos_webview_auto_login()
+
+ws = WsRuntime(cdp_port=9333, log=print, auto_login=auto_login)
+ws.start()
+```
+
+El callback debe iniciar el login en el webview del host. La captura CDP
+(`QTWEBENGINE_REMOTE_DEBUGGING=9333`) detecta el nuevo token de TOS y lo guarda.
+`WsRuntime` espera hasta `token_wait_seconds` a que aparezca el token renovado.
+En hosts Qt, llama los metodos de orden desde un worker, request thread o cola
+externa; el callback de auto-login debe encolar el trabajo al hilo de UI para
+que el webview pueda seguir procesando eventos.
+
+Si Schwab pide MFA, el usuario debe completarlo en el webview; despues la captura
+CDP guarda el token y la orden continua.
+
+## HTTP local opcional
+
+`TosHttpServer` puede exponer metodos directos por HTTP:
+
+- `POST /buy`: compra directa por WebSocket.
+- `POST /sell`: venta directa por WebSocket.
+- `POST /auto_exit`: revision de salida automatica por porcentaje.
+- `GET /broker_positions`: posiciones OPTION abiertas del broker.
+- `GET /day_summary`: resumen del dia y P/L disponible/calculado.
+- `GET /ws_status`: estado del token.
+- `GET /logs`: ultimas lineas de log.
+
+Ejemplo:
 
 ```json
 {
   "symbol": "SPY",
   "direction": "CALL",
-  "strategy": "yoel:investep:midpoint-bounce",
-  "entry_price": 742.0,
-  "strike": 745.0,
-  "expiration": "2026-07-02",
-  "max_investment": 500,
-  "max_contracts": 1
+  "expiration": "2026-07-17",
+  "strike": 625,
+  "quantity": 1,
+  "submit": true
 }
 ```
 
-Si `strike`/`expiration` no vienen, se usa el hook `select_contract`.
+Cliente Python:
 
-## Gestion de salida (prima del contrato)
+```python
+from tos.client import buy_option, sell_option
+from tos.client import auto_exit_percent, broker_positions, day_summary
 
-`TosTradeManager` consulta la prima en cada ciclo (hook `option_premium`):
+buy_option("SPY", "CALL", "2026-07-17", 625, quantity=1)
+sell_option("SPY", "CALL", "2026-07-17", 625, quantity=1)
+auto_exit_percent(take_profit_pct=15, stop_loss_pct=20)
+broker_positions()
+day_summary()
+```
 
-- target **+10%** sobre la prima → activa trailing,
-- trailing: cierra si el extra sobre el target retrocede **10%** desde su pico,
-- stop duro **-20%**.
+## Modulos
 
-Ademas reconcilia contra la cuenta TOS (via WS): detecta cierres manuales y
-verifica que los cierres pedidos de verdad ejecutaron.
+| Modulo | Estado | Que hace |
+|---|---|---|
+| `tos.ws_runtime` | recomendado | Runtime thread-safe con compra/venta, salida por porcentaje, posiciones, resumen, captura CDP y auto-login inyectable |
+| `tos.ws_client` | recomendado | Cliente WebSocket bajo nivel: login, cuentas, posiciones, ordenes CONFIRM/SUBMIT |
+| `tos.server` | opcional | Receptor HTTP local con `/buy` y `/sell` |
+| `tos.client` | opcional | Cliente HTTP para enviar compras/ventas al receptor local |
+| `tos.token_store` / `tos.ws_token_capture` | recomendado | Persistencia y captura del token de sesion |
+| `tos.automation` + `tos.tos_scripts` | opcional `[qt]` | Auto-login Paper Money en un `QWebEnginePage` creado por el host |
+| `tos.alerts` | legado | Gestor de alertas y salidas por prima; no usar en integraciones v1.2 nuevas |
+| `tos.hooks` | legado | Hooks de precios/contratos usados por el gestor anterior |
 
-## Seguridad
+## Guia para cambios por IA
 
-- El script DOM bloquea el envio si detecta cuenta Live o si no confirma Paper Money.
-- Safeguard anti-short: al cerrar solo vende lo que la cuenta tiene del contrato.
-- Token de sesion (~8h) capturado del webview del host via CDP.
+Cuando un agente de IA o colaborador modifique este repo para v1.2:
 
-Ver `tos/WS_PROTOCOL.md` para el detalle del protocolo WsJson.
+- Mantener la API publica centrada en compra/venta, consulta de posiciones,
+  resumen y salida automatica por porcentaje.
+- No agregar seleccion de estrategia, senales de entrada ni gestion compleja de
+  trailing al flujo recomendado.
+- No meter credenciales, tokens ni estado vivo dentro del repo.
+- No hacer que `tos.ws_runtime` dependa de Qt; el auto-login debe seguir siendo
+  callback inyectable desde el host.
+- Mantener Paper Money como contexto de seguridad por defecto.
+- Conservar el safeguard anti-short en ventas.
+
+Ver tambien `AI_CHANGE_GUIDE.md` y `MIGRATION_V1_TO_V2.md`.

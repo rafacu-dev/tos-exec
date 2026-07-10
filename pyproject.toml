@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tos-exec"
-version = "0.2.0"
-description = "Ejecucion de opciones en thinkorswim web Paper Money, solo metodos (sin UI): ordenes por WebSocket, gestion de salidas por prima, receptor HTTP y automation DOM opcional."
+version = "1.2.0"
+description = "Ejecucion de opciones en thinkorswim web Paper Money, solo metodos (sin UI): compra/venta por WebSocket, salida por porcentaje, posiciones, resumen y auto-login renovable."
 requires-python = ">=3.10"
 dependencies = [
     "websockets>=12",
