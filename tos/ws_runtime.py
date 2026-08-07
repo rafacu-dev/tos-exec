@@ -15,30 +15,33 @@ import threading
 import time
 from typing import Callable
 
+from .ws_client import LIVE_WS, PAPER_WS
+
 from tos import token_store, ws_token_capture
-from tos.ws_client import TosWsClient, option_symbol
+from tos.ws_client import (
+    TosWsClient,
+    canonical_option_symbol,
+    option_symbol,
+    position_quantity,
+    position_quantity_value,
+    position_symbol,
+    position_values,
+)
 
 DEFAULT_POSITION_FIELDS = (
     "QUANTITY",
-    "AVERAGE_PRICE",
-    "AVG_PRICE",
     "OPEN_PRICE",
     "MARK",
-    "MARK_PRICE",
-    "LAST",
-    "LAST_PRICE",
-    "COST",
-    "PNL_DAY",
     "PL_DAY",
-    "P/L_DAY",
-    "PNL_OPEN",
     "PL_OPEN",
-    "P/L_OPEN",
+    "PL_PERCENT",
 )
 
 
 def _num(value, default: float | None = None) -> float | None:
     try:
+        if isinstance(value, dict) and "value" in value:
+            value = value.get("value")
         if value in (None, ""):
             return default
         if isinstance(value, str):
@@ -58,32 +61,56 @@ def _first_num(values: dict, *keys: str) -> float | None:
 
 
 def _position_symbol(pos: dict) -> str:
-    inst = pos.get("instrument") or {}
-    return str(inst.get("symbol") or pos.get("symbol") or "")
+    return position_symbol(pos)
 
 
 def _position_quantity(pos: dict) -> float:
-    return _first_num(pos.get("values") or {}, "QUANTITY") or 0.0
+    return position_quantity(pos)
+
+
+def _instrument_type(pos: dict) -> str:
+    if not isinstance(pos, dict):
+        return ""
+    nested = pos.get("position") if isinstance(pos.get("position"), dict) else pos
+    inst = nested.get("instrument") or {}
+    if not isinstance(inst, dict):
+        inst = {}
+    return str(
+        inst.get("instrumentType")
+        or inst.get("assetType")
+        or nested.get("instrumentType")
+        or nested.get("assetType")
+        or ""
+    )
 
 
 def _position_prices(pos: dict) -> tuple[float | None, float | None]:
-    values = pos.get("values") or {}
+    values = position_values(pos)
     entry = _first_num(values, "AVERAGE_PRICE", "AVG_PRICE", "OPEN_PRICE")
     mark = _first_num(values, "MARK", "MARK_PRICE", "LAST", "LAST_PRICE")
     cost = _first_num(values, "COST")
     qty = abs(_position_quantity(pos))
     if entry is None and cost is not None and qty:
         entry = abs(cost) / qty
-        if (pos.get("instrument") or {}).get("instrumentType") == "OPTION":
+        if _is_option_position(pos):
             entry = entry / 100.0
     return entry, mark
 
 
 def _option_parts(sym: str) -> dict | None:
-    m = re.match(r"^\.?([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])([0-9.]+)$", str(sym).upper())
+    normalized = canonical_option_symbol(sym)
+    m = re.match(
+        r"^\.?(?P<root>[A-Z][A-Z0-9.]*)"
+        r"(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})"
+        r"(?P<cp>[CP])(?P<strike>[0-9.]+)$",
+        normalized,
+    )
     if not m:
         return None
-    root, yy, mm, dd, cp, strike = m.groups()
+    root, yy, mm, dd, cp, strike = (
+        m.group("root"), m.group("yy"), m.group("mm"), m.group("dd"),
+        m.group("cp"), m.group("strike"),
+    )
     return {
         "root": root,
         "expiration": f"20{yy}-{mm}-{dd}",
@@ -92,12 +119,17 @@ def _option_parts(sym: str) -> dict | None:
     }
 
 
+def _is_option_position(pos: dict) -> bool:
+    instrument_type = _instrument_type(pos).upper()
+    return "OPTION" in instrument_type or _option_parts(_position_symbol(pos)) is not None
+
+
 def _enrich_position(pos: dict) -> dict:
-    inst = pos.get("instrument") or {}
-    values = pos.get("values") or {}
+    values = position_values(pos)
     qty = _position_quantity(pos)
     entry, mark = _position_prices(pos)
-    multiplier = 100.0 if inst.get("instrumentType") == "OPTION" else 1.0
+    is_option = _is_option_position(pos)
+    multiplier = 100.0 if is_option else 1.0
     open_pl = _first_num(values, "PNL_OPEN", "PL_OPEN", "P/L_OPEN")
     day_pl = _first_num(values, "PNL_DAY", "PL_DAY", "P/L_DAY")
     pnl_pct = None
@@ -106,8 +138,12 @@ def _enrich_position(pos: dict) -> dict:
         if open_pl is None:
             open_pl = round((mark - entry) * qty * multiplier, 2)
     return {
-        "symbol": _position_symbol(pos),
-        "instrument_type": inst.get("instrumentType"),
+        "symbol": (
+            canonical_option_symbol(_position_symbol(pos))
+            if is_option else _position_symbol(pos)
+        ),
+        "instrument_type": _instrument_type(pos),
+        "is_option": is_option,
         "quantity": qty,
         "entry_price": entry,
         "mark_price": mark,
@@ -118,10 +154,89 @@ def _enrich_position(pos: dict) -> dict:
     }
 
 
+class TokenProvider:
+    """De donde sale el token de sesion de TOS.
+
+    El cliente WebSocket NO necesita navegador: `login_token(token)` basta. Lo
+    unico que ataba este runtime al webview era conseguir ese token. Separarlo
+    en un proveedor permite que quien ENVIA ordenes viva donde sea, siempre que
+    alguien le haga llegar un token vigente.
+
+    Contrato: `arrancar()` puede lanzar tareas de fondo; `renovar()` intenta
+    conseguir uno nuevo y devuelve True si lo consiguio.
+    """
+
+    #: True si el proveedor puede obtener un token por si mismo.
+    puede_renovar = False
+
+    async def arrancar(self, log) -> None:
+        return None
+
+    def renovar(self, log, espera_s: float) -> bool:
+        return False
+
+
+class ProveedorCdp(TokenProvider):
+    """El de siempre: escucha el trafico del webview por CDP y captura el token.
+
+    Requiere un navegador con sesion iniciada en la misma maquina.
+    """
+
+    puede_renovar = True
+
+    def __init__(self, cdp_port: int = 9333,
+                 auto_login: Callable[[], object] | None = None):
+        self.cdp_port = cdp_port
+        self.auto_login = auto_login
+
+    async def arrancar(self, log) -> None:
+        while True:
+            try:
+                await ws_token_capture.run(self.cdp_port, log)
+            except Exception:
+                await asyncio.sleep(5)
+
+    def renovar(self, log, espera_s: float) -> bool:
+        if self.auto_login is None:
+            return False
+        log("Token TOS vencido/no disponible; ejecutando auto-login.")
+        try:
+            self.auto_login()
+        except Exception as exc:
+            raise RuntimeError(f"auto-login fallo: {exc}") from exc
+        limite = time.time() + espera_s
+        while time.time() < limite:
+            if token_store.valid():
+                log("Token TOS renovado por auto-login.")
+                return True
+            time.sleep(1.0)
+        return False
+
+
+class ProveedorAlmacen(TokenProvider):
+    """Solo lee el token que otro haya dejado en el almacen. Sin navegador.
+
+    Es el proveedor para un emisor sin interfaz grafica: alguien con sesion
+    (el webview, u otra maquina que lo publique) escribe el token; este lo usa.
+    No puede renovarlo, y por eso falla EXPLICITAMENTE en vez de quedarse
+    esperando a un login que nunca va a ocurrir.
+    """
+
+    puede_renovar = False
+
+    async def arrancar(self, log) -> None:
+        return None
+
+
 class WsRuntime:
     def __init__(self, cdp_port: int = 9333, max_hours: float = 8.0, log=print,
+                 ws_url: str = PAPER_WS, account: str | None = None,
                  auto_login: Callable[[], object] | None = None,
-                 token_wait_seconds: float = 90.0):
+                 token_wait_seconds: float = 90.0,
+                 token_provider: "TokenProvider | None" = None):
+        # Sin proveedor explicito se conserva el comportamiento de siempre
+        # (captura CDP), para no romper a los hosts Qt que ya lo usan.
+        self.token_provider = token_provider or ProveedorCdp(cdp_port, auto_login)
         self.cdp_port = cdp_port
         self.max_hours = max_hours
         self.log = log
@@ -129,6 +244,13 @@ class WsRuntime:
         self.token_wait_seconds = float(token_wait_seconds)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
+        # Endpoint del broker. PAPER por defecto: el modo real se pide
+        # EXPLICITAMENTE pasando LIVE_WS, nunca por omision.
+        self.ws_url = ws_url
+        # Cuenta EXPLICITA. Si es None se usa la del token y, si tampoco,
+        # la primera "tradeable" que devuelva el broker — que es justo como
+        # se manda una orden a la cuenta equivocada teniendo varias.
+        self.account = account
 
     def start(self):
         self.thread.start()
@@ -139,11 +261,7 @@ class WsRuntime:
         self.loop.run_forever()
 
     async def _capture_forever(self):
-        while True:
-            try:
-                await ws_token_capture.run(self.cdp_port, self.log)
-            except Exception:
-                await asyncio.sleep(5)
+        await self.token_provider.arrancar(self.log)
 
     def token_status(self) -> dict | None:
         return token_store.valid(self.max_hours)
@@ -157,26 +275,25 @@ class WsRuntime:
         llama a TosAutomation.ensure_logged_in_paper(...).
         """
         self.auto_login = callback
+        if isinstance(self.token_provider, ProveedorCdp):
+            self.token_provider.auto_login = callback
 
     def _ensure_token(self) -> dict:
         d = token_store.valid(self.max_hours)
         if d:
             return d
-        if self.auto_login is None:
-            raise RuntimeError("sin token válido — haz login en el webview")
-        self.log("Token TOS vencido/no disponible; ejecutando auto-login.")
-        try:
-            self.auto_login()
-        except Exception as exc:
-            raise RuntimeError(f"auto-login falló: {exc}") from exc
-        deadline = time.time() + self.token_wait_seconds
-        while time.time() < deadline:
-            d = token_store.valid(self.max_hours)
-            if d:
-                self.log("Token TOS renovado por auto-login.")
-                return d
-            time.sleep(1.0)
-        raise RuntimeError("auto-login no produjo un token válido a tiempo")
+        if not self.token_provider.puede_renovar:
+            # Un emisor sin navegador no puede resolverlo solo. Falla claro en
+            # vez de esperar a un login que nunca va a ocurrir.
+            raise RuntimeError(
+                "sin token válido y este proveedor no puede renovarlo — "
+                "alguien con sesión tiene que publicar un token vigente")
+        if not self.token_provider.renovar(self.log, self.token_wait_seconds):
+            raise RuntimeError("no se consiguió un token válido a tiempo")
+        d = token_store.valid(self.max_hours)
+        if not d:
+            raise RuntimeError("el proveedor dijo haber renovado pero no hay token")
+        return d
 
     def buy_option(self, root: str, expiration: str, side: str, strike: float,
                    quantity: int = 1, order_type: str = "MARKET", limit_price=None,
@@ -203,6 +320,24 @@ class WsRuntime:
                                  order_type=order_type, limit_price=limit_price,
                                  submit=submit, timeout=timeout)
 
+    def list_accounts(self, timeout: float = 25) -> list[dict]:
+        """Cuentas visibles con el token actual, para poder ELEGIR una."""
+        self._ensure_token()
+        fut = asyncio.run_coroutine_threadsafe(self._accounts(), self.loop)
+        return fut.result(timeout=timeout)
+
+    async def _accounts(self):
+        d = token_store.valid(self.max_hours)
+        if not d:
+            raise RuntimeError("sin token válido — haz login en el webview")
+        c = TosWsClient(self.ws_url)
+        try:
+            await c.connect()
+            await c.login_token(d["token"])
+            return await c.accounts()
+        finally:
+            await c.close()
+
     def positions(self, fields: tuple[str, ...] | list[str] | None = None,
                   timeout: float = 25) -> list[dict]:
         """Devuelve posiciones crudas del broker via WebSocket."""
@@ -214,24 +349,38 @@ class WsRuntime:
     def open_option_positions(self, fields: tuple[str, ...] | list[str] | None = None,
                               timeout: float = 25) -> list[dict]:
         """Devuelve posiciones OPTION abiertas, enriquecidas con P/L calculable."""
-        return [
-            _enrich_position(p)
-            for p in self.positions(fields=fields, timeout=timeout)
-            if (p.get("instrument") or {}).get("instrumentType") == "OPTION"
-            and _position_quantity(p) != 0
-        ]
+        opened = []
+        for position in self.positions(fields=fields, timeout=timeout):
+            if not _is_option_position(position):
+                continue
+            quantity = position_quantity_value(position)
+            if quantity is None:
+                raise RuntimeError(
+                    "position_quantity_unrecognized:"
+                    + canonical_option_symbol(_position_symbol(position))
+                )
+            if quantity != 0:
+                opened.append(_enrich_position(position))
+        return opened
 
     def day_summary(self, fields: tuple[str, ...] | list[str] | None = None,
                     timeout: float = 25) -> dict:
         """Resumen de posiciones abiertas y P/L disponible/calculado del dia."""
-        positions = [_enrich_position(p) for p in self.positions(fields=fields, timeout=timeout)]
+        raw_positions = self.positions(fields=fields, timeout=timeout)
+        for position in raw_positions:
+            if _is_option_position(position) and position_quantity_value(position) is None:
+                raise RuntimeError(
+                    "position_quantity_unrecognized:"
+                    + canonical_option_symbol(_position_symbol(position))
+                )
+        positions = [_enrich_position(p) for p in raw_positions]
         open_positions = [p for p in positions if p["quantity"] != 0]
         day_known = [p["day_pnl"] for p in open_positions if p["day_pnl"] is not None]
         open_known = [p["open_pnl"] for p in open_positions if p["open_pnl"] is not None]
         return {
             "ok": True,
             "open_count": len(open_positions),
-            "option_count": sum(1 for p in open_positions if p["instrument_type"] == "OPTION"),
+            "option_count": sum(1 for p in open_positions if p["is_option"]),
             "day_pnl": round(sum(day_known), 2) if day_known else None,
             "open_pnl": round(sum(open_known), 2) if open_known else None,
             "positions": open_positions,
@@ -279,13 +428,13 @@ class WsRuntime:
             return None
 
     async def _held(self, d):
-        c = TosWsClient()
+        c = TosWsClient(self.ws_url)
         try:
             await c.connect()
             await c.login_token(d["token"])
             if not c.authenticated:
                 return None
-            account = d.get("account_code")
+            account = self.account or d.get("account_code")
             if not account:
                 await c.accounts()
                 account = c.account_code
@@ -293,15 +442,16 @@ class WsRuntime:
                 return None
             held = set()
             for it in await c.positions(account, ["QUANTITY"]):
-                inst = it.get("instrument", {})
-                if inst.get("instrumentType") != "OPTION":
+                if not _is_option_position(it):
                     continue
-                try:
-                    q = float(it.get("values", {}).get("QUANTITY", 0) or 0)
-                except (TypeError, ValueError):
-                    q = 0.0
+                q = position_quantity_value(it)
+                if q is None:
+                    raise RuntimeError(
+                        "position_quantity_unrecognized:"
+                        + canonical_option_symbol(_position_symbol(it))
+                    )
                 if q > 0:
-                    held.add(inst.get("symbol") or it.get("symbol"))
+                    held.add(canonical_option_symbol(_position_symbol(it)))
             return held
         finally:
             await c.close()
@@ -310,13 +460,13 @@ class WsRuntime:
         d = token_store.valid(self.max_hours)
         if not d:
             raise RuntimeError("sin token válido — haz login en el webview")
-        c = TosWsClient()
+        c = TosWsClient(self.ws_url)
         try:
             await c.connect()
             body = await c.login_token(d["token"])
             if not c.authenticated:
                 raise RuntimeError(f"login WS rechazado: {body.get('authenticationStatus')}")
-            account = d.get("account_code")
+            account = self.account or d.get("account_code")
             if not account:
                 await c.accounts()
                 account = c.account_code
@@ -332,23 +482,27 @@ class WsRuntime:
             raise RuntimeError("sin token válido — haz login en el webview")
         stop_threshold = -abs(float(stop_loss_pct)) if stop_loss_pct is not None else None
         target_threshold = float(take_profit_pct) if take_profit_pct is not None else None
-        c = TosWsClient()
+        c = TosWsClient(self.ws_url)
         actions = []
         try:
             await c.connect()
             body = await c.login_token(d["token"])
             if not c.authenticated:
                 raise RuntimeError(f"login WS rechazado: {body.get('authenticationStatus')}")
-            account = d.get("account_code")
+            account = self.account or d.get("account_code")
             if not account:
                 await c.accounts()
                 account = c.account_code
             if not account:
                 raise RuntimeError("sin accountCode disponible")
             for raw in await c.positions(account, DEFAULT_POSITION_FIELDS):
-                inst = raw.get("instrument") or {}
-                if inst.get("instrumentType") != "OPTION":
+                if not _is_option_position(raw):
                     continue
+                if position_quantity_value(raw) is None:
+                    raise RuntimeError(
+                        "position_quantity_unrecognized:"
+                        + canonical_option_symbol(_position_symbol(raw))
+                    )
                 pos = _enrich_position(raw)
                 qty = int(pos["quantity"])
                 if qty <= 0 or pos["pnl_pct"] is None:
@@ -412,7 +566,7 @@ class WsRuntime:
         sym = option_symbol(root, expiration, side, strike)
         trace["option_symbol"] = sym
         trace["token_age_hours"] = d.get("age_hours")
-        c = TosWsClient()
+        c = TosWsClient(self.ws_url)
         try:
             ack = await c.connect()
             trace["handshake"] = {"session": ack.get("session"), "build": ack.get("build")}
@@ -423,7 +577,7 @@ class WsRuntime:
             if not c.authenticated:
                 trace["error"] = "login WS rechazado"
                 return trace
-            account = d.get("account_code")
+            account = self.account or d.get("account_code")
             if not account:
                 await c.accounts()
                 account = c.account_code
@@ -444,26 +598,46 @@ class WsRuntime:
         if not d:
             raise RuntimeError("sin token válido — haz login en el webview")
         sym = option_symbol(root, expiration, side, strike)
-        c = TosWsClient()
+        c = TosWsClient(self.ws_url)
         try:
             await c.connect()
             body = await c.login_token(d["token"])
             if not c.authenticated:
                 raise RuntimeError(f"login WS rechazado: {body.get('authenticationStatus')}")
-            account = d.get("account_code")
+            account = self.account or d.get("account_code")
             if not account:
                 await c.accounts()
                 account = c.account_code
             if not account:
                 raise RuntimeError("sin accountCode disponible")
+            try:
+                held_before = await c.held_quantity(account, sym)
+            except Exception as exc:
+                error = f"pre_submit_position_check_failed:{type(exc).__name__}: {exc}"
+                self.log(f"Orden bloqueada antes de SUBMIT {sym}: {error}")
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "order_id": None,
+                    "price": None,
+                    "symbol": sym,
+                    "stage": "pre_submit_blocked",
+                    "submission_state": "rejected_pre_submit",
+                    "explicit_rejection": True,
+                    "submission_may_have_occurred": False,
+                    "reason": error,
+                    "error": error,
+                    "position_effect_confirmed": False,
+                }
             # SAFEGUARD anti-short: al CERRAR (qty<0) vender solo lo que la cuenta
             # tiene de ese contrato. Si no hay long, NO vender (evita short en descubierto).
             if int(quantity) < 0:
-                held = await c.held_quantity(account, sym)
-                if held <= 0:
+                if held_before <= 0:
                     return {"ok": False, "order_id": None, "price": None, "symbol": sym,
-                            "stage": "skipped", "reason": "sin long que cerrar (safeguard anti-short)"}
-                quantity = -min(abs(int(quantity)), int(held))
+                            "stage": "skipped", "reason": "sin long que cerrar (safeguard anti-short)",
+                            "held_before": held_before, "held_after": held_before,
+                            "position_effect_confirmed": True}
+                quantity = -min(abs(int(quantity)), int(held_before))
             trace = await c.order_full(account, sym, int(quantity),
                                        order_type=order_type, limit_price=limit_price, do_submit=submit)
             from tos.ws_client import submit_result
@@ -473,8 +647,86 @@ class WsRuntime:
                 price = o.get("askPrice") or o.get("midPrice") or o.get("limitPrice")
             except Exception:
                 pass
-            sr = submit_result(trace.get("submit")) if submit else {"ok": True, "order_id": None}
-            return {"ok": bool(sr["ok"]), "order_id": sr["order_id"], "price": price,
-                    "symbol": sym, "stage": "submitted" if submit else "confirmed"}
+            submit_error = trace.get("submit_error")
+            if submit and submit_error:
+                sr = {
+                    "ok": False,
+                    "accepted": False,
+                    "order_id": None,
+                    "submission_state": "unknown_submit_transport_error",
+                    "explicit_rejection": False,
+                    "reason": f"submit_transport_error:{submit_error}",
+                }
+            else:
+                sr = submit_result(trace.get("submit")) if submit else {
+                    "ok": True, "accepted": True, "order_id": None,
+                    "submission_state": "preview", "explicit_rejection": False,
+                    "reason": None,
+                }
+            held_after = held_before
+            position_effect_confirmed = not submit
+            position_reconcile_error = None
+            if submit:
+                # El frame SUBMIT ya salió aunque su respuesta no incluya
+                # orderId. Siempre reconciliamos posición: su efecto puede
+                # confirmar la aceptación y, si no aparece, el estado queda
+                # unknown (nunca "rechazado" por omisión ni reintentable).
+                deadline = asyncio.get_running_loop().time() + 12.0
+                expected = (
+                    held_before + int(quantity)
+                    if int(quantity) > 0
+                    else max(0.0, held_before - abs(int(quantity)))
+                )
+                while True:
+                    try:
+                        held_after = await c.held_quantity(account, sym)
+                    except Exception as exc:
+                        position_reconcile_error = f"{type(exc).__name__}: {exc}"
+                        self.log(
+                            f"ALERTA ejecución ambigua {sym}: SUBMIT ya intentado; "
+                            f"reconciliación de posición falló ({position_reconcile_error})"
+                        )
+                        break
+                    if (
+                        (int(quantity) > 0 and held_after >= expected)
+                        or (int(quantity) < 0 and held_after <= expected)
+                    ):
+                        position_effect_confirmed = True
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        break
+                    await asyncio.sleep(0.5)
+            accepted = bool(sr.get("accepted") or position_effect_confirmed)
+            if position_effect_confirmed and submit:
+                submission_state = "position_effect_confirmed"
+            elif sr.get("explicit_rejection"):
+                submission_state = "rejected"
+            elif accepted:
+                submission_state = str(sr.get("submission_state") or "accepted")
+            elif position_reconcile_error:
+                submission_state = "unknown_position_reconcile_error"
+            else:
+                submission_state = str(sr.get("submission_state") or "unknown")
+            reason = None if accepted else sr.get("reason")
+            if not accepted and position_reconcile_error and not sr.get("explicit_rejection"):
+                reason = f"post_submit_position_reconcile_error:{position_reconcile_error}"
+            return {"ok": accepted, "accepted": accepted,
+                    "submission_state": submission_state,
+                    "explicit_rejection": bool(sr.get("explicit_rejection")),
+                    "submission_may_have_occurred": bool(
+                        submit and not sr.get("explicit_rejection")
+                    ),
+                    "reason": reason,
+                    "error": reason,
+                    "submit_transport_error": submit_error,
+                    "position_reconcile_error": position_reconcile_error,
+                    "order_id": sr.get("order_id"), "price": price,
+                    "symbol": sym, "stage": "submitted" if submit else "confirmed",
+                    "held_before": held_before, "held_after": held_after,
+                    "position_effect_confirmed": position_effect_confirmed,
+                    "position_closed_confirmed": bool(
+                        submit and int(quantity) < 0 and position_effect_confirmed
+                        and held_after <= 0
+                    )}
         finally:
             await c.close()
