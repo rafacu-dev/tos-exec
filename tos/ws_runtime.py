@@ -233,7 +233,8 @@ class WsRuntime:
                  ws_url: str = PAPER_WS, account: str | None = None,
                  auto_login: Callable[[], object] | None = None,
                  token_wait_seconds: float = 90.0,
-                 token_provider: "TokenProvider | None" = None):
+                 token_provider: "TokenProvider | None" = None,
+                 enrutador: "Callable[[], tuple[str, str | None]] | None" = None):
         # Sin proveedor explicito se conserva el comportamiento de siempre
         # (captura CDP), para no romper a los hosts Qt que ya lo usan.
         self.token_provider = token_provider or ProveedorCdp(cdp_port, auto_login)
@@ -251,6 +252,26 @@ class WsRuntime:
         # la primera "tradeable" que devuelva el broker — que es justo como
         # se manda una orden a la cuenta equivocada teniendo varias.
         self.account = account
+        # Resuelve (ws_url, cuenta) JUSTO ANTES de cada orden en vez de fijarlo
+        # al construir el runtime. Asi lo que manda es lo que el operador tiene
+        # seleccionado en ese momento, no lo que hubiera al arrancar la app: una
+        # app abierta desde ayer no puede enviar a un sitio que ya cambio.
+        self.enrutador = enrutador
+
+    def _resolver_enrutado(self) -> None:
+        """Aplica el enrutado vigente. Silencioso si no hay enrutador."""
+        if self.enrutador is None:
+            return
+        try:
+            url, cuenta = self.enrutador()
+        except Exception as exc:
+            raise RuntimeError(f"no se pudo resolver el enrutado: {exc}") from exc
+        if not url:
+            raise RuntimeError("el enrutador no devolvio endpoint")
+        if url != self.ws_url or cuenta != self.account:
+            destino = "REAL" if "papermoney" not in url else "PAPER"
+            self.log(f"Enrutado de la orden: {destino} · cuenta {cuenta or '(sin cuenta)'}")
+        self.ws_url, self.account = url, cuenta
 
     def start(self):
         self.thread.start()
@@ -410,6 +431,7 @@ class WsRuntime:
                      quantity: int, order_type: str = "MARKET", limit_price=None,
                      submit: bool = False, timeout: float = 40) -> dict:
         """quantity>0 compra, <0 venta. submit=False solo hace el review (CONFIRM)."""
+        self._resolver_enrutado()
         self._ensure_token()
         fut = asyncio.run_coroutine_threadsafe(
             self._place(root, expiration, side, strike, quantity, order_type, limit_price, submit),
