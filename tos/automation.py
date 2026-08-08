@@ -234,8 +234,9 @@ class TosAutomation(QObject):
                 self.navigate.emit(frame_url)
                 return
 
-        # caso 2: estamos DENTRO del iframe de login con formulario → inyectar login
-        if in_login_frame and login_form_here:
+        # caso 2: hay formulario de login visible. Schwab/TOS puede mostrarlo
+        # dentro de sws-gateway o directamente en trade.thinkorswim.com.
+        if login_form_here:
             if not (self._user and self._password):
                 self._end(False, "Hace falta login pero no hay credenciales guardadas.")
                 return
@@ -268,6 +269,56 @@ class TosAutomation(QObject):
         # login enviado: esperar a que cargue y revalidar estado
         self._emit("Login enviado; esperando carga de la sesión…")
         QTimer.singleShot(4000, self._check_state)
+
+    def ensure_live_account(self):
+        """Pone thinkorswim en Real Live Trading. Espejo de ensure_logged_in_paper.
+
+        No hace login: se asume sesion abierta. Solo mueve el selector de cuenta
+        para que la captura de token recoja el token del entorno real.
+        """
+        if self._busy:
+            self._emit("Automatización ocupada; espera a que termine…")
+            return False
+        self._busy = True
+        self._live_tries = 0
+        self._ensure_live()
+        return True
+
+    def _ensure_live(self):
+        if getattr(self, "_live_tries", 0) >= 3:
+            self._end(False, "No pude activar Real Live Trading tras varios intentos.")
+            return
+        self._live_tries = getattr(self, "_live_tries", 0) + 1
+        self._emit(f"Cambiando a Real Live Trading (intento {self._live_tries})…")
+        self.runner.run(tos_scripts.live_mode_script(), self._on_live, timeout_ms=16000)
+
+    def _on_live(self, res: dict):
+        state = res.get("state", "")
+        if res.get("ok") and state == "LIVE_CONFIRMED":
+            self._paper_confirmed = False
+            self._end(True, "Real Live Trading activo.")
+            return
+        if state == "LIVE_SWITCH_REQUESTED":
+            self._emit("Cambio a Real solicitado; revalidando…")
+            QTimer.singleShot(2500, self._ensure_live)
+            return
+        self._end(False, f"No pude activar Real Live Trading ({state}).")
+
+    def ensure_paper_account(self):
+        """Devuelve thinkorswim a Paper Money SIN relanzar el login.
+
+        Espejo exacto de ``ensure_live_account``. Antes, para volver a papel se
+        llamaba a ``ensure_logged_in_paper``, que es el flujo COMPLETO de login:
+        con la sesion ya abierta toma otra rama y puede no llegar a tocar el
+        selector de cuenta. El cambio de cuenta y el login son cosas distintas.
+        """
+        if self._busy:
+            self._emit("Automatización ocupada; espera a que termine…")
+            return False
+        self._busy = True
+        self._paper_tries = 0
+        self._ensure_paper()
+        return True
 
     def _ensure_paper(self):
         if self._paper_tries >= 3:

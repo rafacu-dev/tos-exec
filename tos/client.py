@@ -6,6 +6,56 @@ import requests
 DEFAULT_ENDPOINT = "http://127.0.0.1:5060"
 
 
+def _order_headers(auth_token: str | None) -> dict[str, str]:
+    return {"X-TOS-Order-Token": str(auth_token)} if auth_token else {}
+
+
+def _order_response(resp: requests.Response) -> dict:
+    """Conserva la clasificación del executor incluso en respuestas HTTP 4xx/5xx.
+
+    Una excepción HTTP genérica borra justo la información necesaria para
+    distinguir un rechazo previo al SUBMIT de una orden enviada cuyo resultado
+    quedó ambiguo. Las rutas de orden siempre devuelven un objeto clasificable.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if isinstance(data, dict) and isinstance(data.get("result"), dict):
+        data.setdefault("http_status", status)
+        return data
+    if 200 <= status < 300 and isinstance(data, dict):
+        return data
+
+    error = (
+        str((data or {}).get("error") or (data or {}).get("reason") or "")
+        if isinstance(data, dict) else str(getattr(resp, "text", "") or "")
+    )
+    pre_submit = bool(
+        status in {401, 403}
+        or error in {"order_token_required", "WS no activo"}
+        or (isinstance(data, dict) and data.get("submission_may_have_occurred") is False)
+    )
+    result = {
+        "ok": False,
+        "accepted": False,
+        "order_id": None,
+        "submission_state": "rejected_pre_submit" if pre_submit else "unknown_http_error",
+        "explicit_rejection": pre_submit,
+        "submission_may_have_occurred": not pre_submit,
+        "reason": error or f"executor_http_{status or 'unknown'}",
+        "error": error or f"executor_http_{status or 'unknown'}",
+        "http_status": status,
+    }
+    return {
+        "ok": False,
+        "error": result["error"],
+        "http_status": status,
+        "result": result,
+    }
+
+
 def _option_payload(symbol: str, direction: str, expiration: str, strike: float,
                     quantity: int = 1, order_type: str = "MARKET",
                     limit_price=None, submit: bool = True) -> dict:
@@ -26,25 +76,29 @@ def _option_payload(symbol: str, direction: str, expiration: str, strike: float,
 def buy_option(symbol: str, direction: str, expiration: str, strike: float,
                quantity: int = 1, order_type: str = "MARKET", limit_price=None,
                submit: bool = True, endpoint: str = DEFAULT_ENDPOINT,
-               timeout: int = 45) -> dict:
+               timeout: int = 45, auth_token: str | None = None) -> dict:
     """Compra directa por WebSocket. No registra ni gestiona salida."""
     payload = _option_payload(symbol, direction, expiration, strike, quantity,
                               order_type, limit_price, submit)
-    resp = requests.post(f"{endpoint.rstrip('/')}/buy", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    resp = requests.post(
+        f"{endpoint.rstrip('/')}/buy", json=payload, timeout=timeout,
+        headers=_order_headers(auth_token),
+    )
+    return _order_response(resp)
 
 
 def sell_option(symbol: str, direction: str, expiration: str, strike: float,
                 quantity: int = 1, order_type: str = "MARKET", limit_price=None,
                 submit: bool = True, endpoint: str = DEFAULT_ENDPOINT,
-                timeout: int = 45) -> dict:
+                timeout: int = 45, auth_token: str | None = None) -> dict:
     """Venta directa por WebSocket. El servidor aplica safeguard anti-short."""
     payload = _option_payload(symbol, direction, expiration, strike, quantity,
                               order_type, limit_price, submit)
-    resp = requests.post(f"{endpoint.rstrip('/')}/sell", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    resp = requests.post(
+        f"{endpoint.rstrip('/')}/sell", json=payload, timeout=timeout,
+        headers=_order_headers(auth_token),
+    )
+    return _order_response(resp)
 
 
 def auto_exit_percent(take_profit_pct: float | None = None,
