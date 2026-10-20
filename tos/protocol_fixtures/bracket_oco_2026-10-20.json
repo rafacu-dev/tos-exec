@@ -1,0 +1,22 @@
+{
+  "_captura": "thinkorswim web, paperMoney, 2026-10-20 08:26 ET, build 27.2640.4-Q3. Orden 1st trgs OCO sobre F (acciones). Cuenta reemplazada por <ACCOUNT>.",
+  "confirm": {"payload": [{"header": {"service": "place_order", "id": "update-draft-order-F", "ver": 12},
+    "params": {"action": "CONFIRM", "accountCode": "<ACCOUNT>", "marker": "FIRST_TRIGGERS_OCO", "orders": [
+      {"tif": "DAY", "orderType": "LIMIT", "requestType": "EDIT_ORDER", "limitPrice": 10, "legs": [{"symbol": "F", "quantity": 1}], "tag": "TOSWeb"},
+      {"tif": "DAY", "orderType": "LIMIT", "requestType": "EDIT_ORDER", "limitPrice": 14, "legs": [{"symbol": "F", "quantity": -1}], "tag": "TOSWeb"},
+      {"tif": "DAY", "orderType": "STOP", "requestType": "EDIT_ORDER", "stopPrice": 9, "legs": [{"symbol": "F", "quantity": -1}], "tag": "TOSWeb"}]}}]},
+  "submit": {"payload": [{"header": {"ver": 0, "service": "place_order", "id": "update-draft-order-F"},
+    "params": {"accountCode": "<ACCOUNT>", "action": "SUBMIT", "marker": "FIRST_TRIGGERS_OCO", "orders": [
+      {"tif": "DAY", "orderType": "LIMIT", "limitPrice": 10, "requestType": "EDIT_ORDER", "legs": [{"symbol": "F", "quantity": 1}], "tag": "TOSWeb"},
+      {"tif": "DAY", "orderType": "LIMIT", "limitPrice": 14, "requestType": "EDIT_ORDER", "legs": [{"symbol": "F", "quantity": -1}], "tag": "TOSWeb"},
+      {"tif": "DAY", "orderType": "STOP", "stopPrice": 9, "requestType": "EDIT_ORDER", "legs": [{"symbol": "F", "quantity": -1}], "tag": "TOSWeb"}]}}]},
+  "submit_response_body_parcial": {"patches": [
+    {"op": "remove", "path": "/confirmation/rows"},
+    {"op": "replace", "path": "/orders/2/orderId", "value": 5413682775},
+    {"op": "replace", "path": "/orders/2/stopPrice", "value": 9.0},
+    {"op": "replace", "path": "/orders/2/confirmation", "value": "TOSWeb SELL -1 F STP 9.00 TRG BY OCO"},
+    {"op": "replace", "path": "/orders/1/orderId", "value": 5413682774},
+    {"op": "replace", "path": "/orders/1/confirmation", "value": "TOSWeb SELL -1 F @14.00 LMT TRG BY OCO"},
+    {"op": "replace", "path": "/orders/0/orderId", "value": 5413682772}]},
+  "cancel": {"payload": [{"header": {"service": "cancel_order", "id": "cancel-5413682772", "ver": 0}, "params": {"orderId": 5413682772}}]}
+}

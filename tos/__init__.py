@@ -6,7 +6,7 @@ resuelven de forma perezosa: `tos.client` y `tos.ws_client` funcionan sin Qt
 instalado.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "WsRuntime",

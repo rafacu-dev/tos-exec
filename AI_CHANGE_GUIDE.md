@@ -1,6 +1,6 @@
 # Guia de cambios para agentes de IA
 
-Este repo esta en la linea **v1.2.x**.
+Este repo esta en la linea **v1.3.x**.
 
 ## Regla principal
 
@@ -23,7 +23,23 @@ por WebSocket y expone utilidades explicitas de gestion:
 - `tos.client.broker_positions(...)`
 - `tos.client.day_summary(...)`
 
+Desde v1.4 tambien:
+
+- `WsRuntime.place_bracket(...)` / `bracket_option(...)`: entrada de compra con
+  take profit y stop loss en una orden `FIRST_TRIGGERS_OCO` de TOS.
+- `WsRuntime.cancel_order(...)`, `POST /bracket`, `POST /cancel_order`,
+  `tos.client.place_bracket(...)`, `tos.client.cancel_order(...)`.
+
 No introducir logica de estrategia ni senales de entrada en esta API.
+
+## Si TOS cambia el protocolo
+
+El formato del gateway no es publico. Ante ordenes que fallan o un `build`
+nuevo en el handshake: recapturar segun "Como recapturar y detectar cambios" en
+`tos/WS_PROTOCOL.md`, guardar un fixture nuevo con fecha en
+`tos/protocol_fixtures/` y correr `tests/test_tos_bracket_order.py` (raiz de
+LocalQuantAI) contra el: el test muestra que campo cambio. Ajustar
+`TosWsClient._bracket_params` y documentar el cambio en WS_PROTOCOL.md.
 
 ## No hacer
 
@@ -55,6 +71,14 @@ deben venir de un worker/request thread, y el callback debe encolar el login al
 hilo de UI.
 
 Si Schwab pide MFA, el usuario lo completa en el webview. No intentar saltar MFA.
+
+## Login en servidor
+
+`tos.headless_login` hace el login con un Chromium headless propio y credenciales
+de `TOS_USERNAME`/`TOS_PASSWORD` (secretos del entorno, nunca en el repo). El
+MFA lo aporta el usuario por `POST /mfa`; no automatizar ni saltar su obtencion.
+No reintentar logins fallidos en bucle: el limite de 3 fallos en `tos.servicio`
+protege la cuenta de bloqueos.
 
 ## Compatibilidad legada
 

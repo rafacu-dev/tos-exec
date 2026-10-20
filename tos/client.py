@@ -101,6 +101,49 @@ def sell_option(symbol: str, direction: str, expiration: str, strike: float,
     return _order_response(resp)
 
 
+def place_bracket(symbol: str, quantity: int, take_profit: float, stop_loss: float,
+                  entry_type: str = "LIMIT", entry_limit=None, tif: str = "DAY",
+                  submit: bool = True, expiration: str | None = None,
+                  direction: str | None = None, strike: float | None = None,
+                  endpoint: str = DEFAULT_ENDPOINT, timeout: int = 45,
+                  auth_token: str | None = None) -> dict:
+    """Entrada + take profit + stop loss (1st trgs OCO).
+
+    Para opciones pasar `expiration`, `direction` y `strike`; si no, `symbol`
+    es el símbolo TOS directo. `result.order_ids.entry` sirve para cancelar.
+    """
+    payload: dict = {
+        "symbol": str(symbol).upper(),
+        "quantity": int(quantity),
+        "take_profit": float(take_profit),
+        "stop_loss": float(stop_loss),
+        "entry_type": str(entry_type).upper(),
+        "tif": str(tif).upper(),
+        "submit": bool(submit),
+    }
+    if entry_limit is not None:
+        payload["entry_limit"] = float(entry_limit)
+    if expiration is not None:
+        payload.update(expiration=str(expiration), direction=str(direction).upper(),
+                       strike=float(strike))
+    resp = requests.post(
+        f"{endpoint.rstrip('/')}/bracket", json=payload, timeout=timeout,
+        headers=_order_headers(auth_token),
+    )
+    return _order_response(resp)
+
+
+def cancel_order(order_id: int, endpoint: str = DEFAULT_ENDPOINT, timeout: int = 30,
+                 auth_token: str | None = None) -> dict:
+    """Cancela una orden; con la entrada de un bracket cancela sus 3 patas."""
+    resp = requests.post(
+        f"{endpoint.rstrip('/')}/cancel_order", json={"order_id": int(order_id)},
+        timeout=timeout, headers=_order_headers(auth_token),
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def auto_exit_percent(take_profit_pct: float | None = None,
                       stop_loss_pct: float | None = None,
                       submit: bool = True, dry_run: bool = False,

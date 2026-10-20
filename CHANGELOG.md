@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.4.0
+
+- Ordenes bracket (entrada + take profit + stop loss) en una sola orden
+  `FIRST_TRIGGERS_OCO` de TOS: `WsRuntime.place_bracket()`,
+  `WsRuntime.bracket_option()`, `POST /bracket`, `tos.client.place_bracket()`.
+  Solo entradas de compra; valida `stop_loss < entry_limit < take_profit`
+  antes de conectar.
+- Cancelacion por id: `WsRuntime.cancel_order()`, `POST /cancel_order`,
+  `tos.client.cancel_order()`. Con la entrada de un bracket cancela las 3 patas.
+- Protocolo OCO documentado en `tos/WS_PROTOCOL.md` con la captura real en
+  `tos/protocol_fixtures/bracket_oco_2026-10-20.json` y el procedimiento para
+  recapturar y detectar cambios del broker.
+
+## 1.3.0
+
+- Login en un servidor sin pantalla: `tos.headless_login` abre un Chromium
+  headless (Playwright, extra `[server]`), usa `TOS_USERNAME`/`TOS_PASSWORD`
+  del entorno, deja la sesion en Paper Money y captura el token por CDP.
+- `ProveedorNavegador`: proveedor de token para `WsRuntime` que renueva solo.
+- MFA por HTTP: `GET /login_status`, `POST /login`, `POST /mfa`,
+  `GET /login_screenshot` (las tres ultimas con `X-TOS-Order-Token`).
+- `python -m tos.servicio`: login + API HTTP en un proceso; renueva el token al
+  vencer y se detiene tras 3 fallos seguidos para no bloquear la cuenta.
+- Corrige la captura del token: si TOS reenvia el mismo token tras recargar y el
+  guardado ya vencio, se vuelve a guardar (antes la sesion nunca se renovaba en
+  un proceso de larga vida).
+
 ## 1.2.0
 
 - Define la API recomendada como metodos explicitos de compra/venta:

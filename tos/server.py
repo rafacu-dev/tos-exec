@@ -7,11 +7,17 @@ Expone API local para integraciones:
 - POST /buy       compra directa por WebSocket (API v1.2, sin gestion).
 - POST /sell      vende directa por WebSocket (API v1.2, sin gestion).
 - POST /auto_exit salida automatica por porcentaje sobre posiciones abiertas.
+- POST /bracket   entrada + take profit + stop loss en una orden 1st-trgs-OCO.
+- POST /cancel_order cancela por order_id (con la entrada cancela el bracket).
 - POST /ws_order  orden directa por WebSocket (prueba; submit=false = review).
 - GET  /positions posiciones abiertas (broker si no hay manager; legado si hay manager).
 - GET  /day_summary resumen del dia con P/L disponible/calculado.
 - GET  /logs      ultimas lineas de log.
 - GET  /ws_status estado del token WS.
+- GET  /login_status       estado del login headless (servidor).
+- GET  /login_screenshot   captura PNG del navegador headless (protegida).
+- POST /login              fuerza el login headless (protegida).
+- POST /mfa                envia el codigo MFA {"code": "..."} (protegida).
 
 Uso directo v1.2 (thread-safe con la ruta WS):
 
@@ -78,6 +84,31 @@ def _order_payload(payload: dict) -> dict:
     }
 
 
+def _bracket_payload(payload: dict) -> dict:
+    """Argumentos de WsRuntime.place_bracket. Acepta `symbol` TOS directo o
+    las piezas de una opcion (symbol/root + expiration + direction + strike)."""
+    symbol = str(payload.get("symbol") or payload.get("root") or "").upper()
+    if not symbol:
+        raise ValueError("symbol requerido")
+    if payload.get("expiration") is not None:
+        from tos.ws_client import option_symbol
+        symbol = option_symbol(
+            symbol, str(payload["expiration"]),
+            str(payload.get("direction") or payload.get("side") or ""),
+            float(payload["strike"]))
+    entry_limit = payload.get("entry_limit")
+    return {
+        "symbol": symbol,
+        "quantity": int(payload.get("quantity", 1)),
+        "take_profit": float(payload["take_profit"]),
+        "stop_loss": float(payload["stop_loss"]),
+        "entry_type": str(payload.get("entry_type", "LIMIT")).upper(),
+        "entry_limit": float(entry_limit) if entry_limit is not None else None,
+        "tif": str(payload.get("tif", "DAY")).upper(),
+        "submit": _strict_bool(payload, "submit", True),
+    }
+
+
 def _order_failure(error: str, *, may_have_submitted: bool, state: str) -> dict:
     result = {
         "ok": False,
@@ -95,8 +126,15 @@ def _order_failure(error: str, *, may_have_submitted: bool, state: str) -> dict:
 def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                  on_alert: Callable[[dict], None] | None = None,
                  on_close: Callable[[str, str], None] | None = None,
-                 order_token: str | None = None):
+                 order_token: str | None = None,
+                 login_manager=None):
     logs = log_lines if log_lines is not None else []
+
+    def has_order_token(handler) -> bool:
+        if not order_token:
+            return True
+        supplied = str(handler.headers.get("X-TOS-Order-Token") or "")
+        return hmac.compare_digest(supplied, str(order_token))
 
     def record_order_error(path: str, payload: dict, phase: str, exc) -> None:
         safe_payload = payload if isinstance(payload, dict) else {}
@@ -153,6 +191,30 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                 _json_response(self, 200, {"ok": True, "ws_enabled": ws_runtime is not None,
                                            "token_valid": bool(d), "age_hours": (d or {}).get("age_hours")})
                 return
+            if path == "/login_status":
+                if login_manager is None:
+                    _json_response(self, 400, {"ok": False, "error": "login headless no activo"})
+                    return
+                _json_response(self, 200, {"ok": True, **login_manager.status()})
+                return
+            if path == "/login_screenshot":
+                # Puede mostrar datos de la cuenta: misma clave que las ordenes.
+                if login_manager is None or not has_order_token(self):
+                    _json_response(self, 403 if login_manager else 400,
+                                   {"ok": False, "error": "order_token_required" if login_manager else "login headless no activo"})
+                    return
+                try:
+                    with open(login_manager.screenshot(), "rb") as fh:
+                        raw = fh.read()
+                except Exception as exc:
+                    _json_response(self, 500, {"ok": False, "error": str(exc)})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             _json_response(self, 404, {"ok": False, "error": "not_found"})
 
         def do_POST(self):
@@ -164,11 +226,12 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                 return
 
             path = self.path.rstrip("/")
-            protected = {"/alert", "/close", "/buy", "/sell", "/auto_exit", "/ws_order"}
+            protected = {"/alert", "/close", "/buy", "/sell", "/auto_exit", "/ws_order",
+                         "/bracket", "/cancel_order", "/login", "/mfa"}
             if order_token and path in protected:
                 supplied = str(self.headers.get("X-TOS-Order-Token") or "")
                 if not hmac.compare_digest(supplied, str(order_token)):
-                    if path in {"/buy", "/sell", "/ws_order"}:
+                    if path in {"/buy", "/sell", "/ws_order", "/bracket"}:
                         response = _order_failure(
                             "order_token_required",
                             may_have_submitted=False,
@@ -264,6 +327,51 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                         state="unknown_runtime_exception",
                     ))
                 return
+            if path == "/bracket":
+                if ws_runtime is None:
+                    _json_response(self, 400, _order_failure(
+                        "WS no activo", may_have_submitted=False,
+                        state="rejected_pre_submit",
+                    ))
+                    return
+                try:
+                    args = _bracket_payload(payload)
+                    from tos.ws_client import validate_bracket
+                    validate_bracket(args["quantity"], args["take_profit"],
+                                     args["stop_loss"], args["entry_type"],
+                                     args["entry_limit"], args["tif"])
+                except Exception as exc:
+                    record_order_error(path, payload, "validation_pre_submit", exc)
+                    _json_response(self, 400, _order_failure(
+                        f"invalid_order_payload:{exc}", may_have_submitted=False,
+                        state="rejected_pre_submit",
+                    ))
+                    return
+                try:
+                    res = ws_runtime.place_bracket(**args)
+                    _json_response(self, 200, {"ok": bool(res.get("ok")), "result": res})
+                except Exception as exc:
+                    record_order_error(path, payload, "runtime_submission_unknown", exc)
+                    _json_response(self, 502, _order_failure(
+                        f"executor_runtime_error:{type(exc).__name__}: {exc}",
+                        may_have_submitted=True,
+                        state="unknown_runtime_exception",
+                    ))
+                return
+            if path == "/cancel_order":
+                if ws_runtime is None:
+                    _json_response(self, 400, {"ok": False, "error": "WS no activo"})
+                    return
+                try:
+                    order_id = int(payload["order_id"])
+                except Exception:
+                    _json_response(self, 400, {"ok": False, "error": "order_id entero requerido"})
+                    return
+                try:
+                    _json_response(self, 200, ws_runtime.cancel_order(order_id))
+                except Exception as exc:
+                    _json_response(self, 502, {"ok": False, "error": str(exc)})
+                return
             if path == "/auto_exit":
                 if ws_runtime is None:
                     _json_response(self, 400, {"ok": False, "error": "WS no activo"})
@@ -296,6 +404,20 @@ def make_handler(manager, ws_runtime=None, log_lines: list[str] | None = None,
                 except Exception as exc:
                     _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
+            if path in ("/login", "/mfa"):
+                if login_manager is None:
+                    _json_response(self, 400, {"ok": False, "error": "login headless no activo"})
+                    return
+                try:
+                    if path == "/login":
+                        state = login_manager.login()
+                    else:
+                        state = login_manager.submit_mfa(str(payload.get("code") or ""))
+                except Exception as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                    return
+                _json_response(self, 200, {"ok": state.get("state") == "ready", **login_manager.status()})
+                return
             _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     return Handler
@@ -308,14 +430,15 @@ class TosHttpServer:
                  ws_runtime=None, log_lines: list[str] | None = None,
                  on_alert: Callable[[dict], None] | None = None,
                  on_close: Callable[[str, str], None] | None = None,
-                 order_token: str | None = None):
+                 order_token: str | None = None,
+                 login_manager=None):
         self.host = host
         self.port = int(port)
         self.httpd = ThreadingHTTPServer(
             (host, self.port),
             make_handler(manager, ws_runtime=ws_runtime, log_lines=log_lines,
                          on_alert=on_alert, on_close=on_close,
-                         order_token=order_token))
+                         order_token=order_token, login_manager=login_manager))
         self._thread: threading.Thread | None = None
 
     @property

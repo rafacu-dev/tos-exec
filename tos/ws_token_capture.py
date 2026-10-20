@@ -87,9 +87,12 @@ async def run(port: int = DEFAULT_PORT, log=print):
                 if not pl:
                     continue
                 tok = _extract_token(pl)
-                if tok and tok != last_token:
+                # Tras recargar, TOS puede reenviar el MISMO token de una sesion
+                # viva: si el guardado ya vencio hay que volver a guardarlo, o la
+                # ventana de validez nunca se renueva en un proceso de larga vida.
+                if tok and (tok != last_token or not token_store.valid()):
                     last_token = tok
-                    token_store.save(tok, account_code=last_acct)
+                    token_store.save(tok, account_code=last_acct or (token_store.load() or {}).get("account_code"))
                     log("✓ Token de sesión capturado y guardado (válido ~8h).")
                 acct = _extract_account(pl)
                 if acct and acct != last_acct:

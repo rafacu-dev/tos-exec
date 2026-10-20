@@ -1,6 +1,6 @@
 # tos-exec
 
-Version actual: **1.2.0**.
+Version actual: **1.4.0**.
 
 Libreria independiente para interactuar con **thinkorswim web Paper Money**
 mediante el gateway WebSocket de Schwab. No trae UI propia: el proyecto host
@@ -93,6 +93,28 @@ El P/L% se calcula con los campos que devuelva TOS (`AVERAGE_PRICE` /
 `OPEN_PRICE` y `MARK` / `LAST`). Si TOS no entrega datos suficientes para una
 posicion, esa posicion se reporta como `skip` y no se vende a ciegas.
 
+## Bracket: stop loss + take profit (OCO)
+
+Una sola orden `1st trgs OCO` de TOS: la entrada de compra dispara dos salidas
+que se cancelan entre si (take profit LIMIT y stop loss STOP).
+
+```python
+res = ws.place_bracket("F", quantity=1, entry_type="LIMIT", entry_limit=10.00,
+                       take_profit=14.00, stop_loss=9.00, submit=True)
+res["order_ids"]   # {"entry": ..., "take_profit": ..., "stop_loss": ...}
+
+# opciones (precios por contrato):
+ws.bracket_option("SPY", "2026-07-15", "PUT", 755, quantity=1,
+                  entry_limit=2.00, take_profit=3.00, stop_loss=1.00)
+
+ws.cancel_order(res["order_ids"]["entry"])  # cancela las 3 patas
+```
+
+Solo entradas de compra; se exige `stop_loss < entry_limit < take_profit`
+(con `entry_type="MARKET"`, solo `stop_loss < take_profit`). `submit=False` hace
+solo el review (CONFIRM). Protocolo y como detectar cambios del broker:
+`tos/WS_PROTOCOL.md`.
+
 ## Posiciones y resumen del dia
 
 ```python
@@ -136,6 +158,63 @@ que el webview pueda seguir procesando eventos.
 Si Schwab pide MFA, el usuario debe completarlo en el webview; despues la captura
 CDP guarda el token y la orden continua.
 
+## Login en un servidor (sin pantalla)
+
+En un servidor no hay webview: `tos.headless_login` abre su propio Chromium sin
+pantalla (Playwright), rellena usuario y contrasena desde **secretos del
+entorno**, deja la sesion en Paper Money y el token se captura igual que en el
+escritorio. El perfil del navegador es persistente (`<TOS_DATA_DIR>/chromium-profile`)
+y conserva el "recordar este dispositivo", asi que Schwab pide MFA lo menos posible.
+
+```bash
+pip install "tos-exec[server] @ git+https://github.com/<usuario>/tos-exec.git"
+python -m playwright install --with-deps chromium
+
+export TOS_USERNAME=...          # secreto
+export TOS_PASSWORD=...          # secreto
+export TOS_ORDER_TOKEN=...       # clave de la API (X-TOS-Order-Token)
+export TOS_DATA_DIR=/data/tos    # disco persistente: token + perfil
+python -m tos.servicio           # login + API HTTP en un proceso
+```
+
+Variables opcionales: `TOS_HTTP_HOST` (127.0.0.1), `TOS_HTTP_PORT` (5060),
+`TOS_CDP_PORT` (9333), `TOS_RENEW_MINUTES` (5). Si la API escucha fuera de
+localhost, `TOS_ORDER_TOKEN` es obligatorio.
+
+El servicio hace login al arrancar y vuelve a hacerlo cuando el token vence.
+Tras 3 fallos seguidos deja de reintentar solo (una contrasena mala, insistida,
+bloquearia la cuenta); `POST /login` lo vuelve a intentar.
+
+**MFA.** Si Schwab pide un codigo, el login se detiene y `GET /login_status`
+devuelve `"state": "mfa_required"` (el servicio ya pidio que te lo envien). Envia
+el codigo que recibiste:
+
+```bash
+curl -X POST "$URL/mfa" -H "X-TOS-Order-Token: $TOS_ORDER_TOKEN" \
+     -H "Content-Type: application/json" -d '{"code": "123456"}'
+```
+
+Nunca se intenta saltar el MFA. Si algo no avanza, `GET /login_screenshot`
+(protegida con la misma clave) devuelve una captura PNG del navegador.
+
+Los selectores de la pantalla de MFA se eligen por patron (texto, `one-time-code`,
+`inputmode=numeric`) y se probaron contra un thinkorswim simulado, no contra el
+DOM real de Schwab: si Schwab cambia esa pantalla, ajustarlos en
+`tos/tos_scripts.py` usando la captura.
+
+Uso como libreria, sin el servicio:
+
+```python
+from tos.headless_login import HeadlessLogin, ProveedorNavegador
+from tos.ws_runtime import WsRuntime
+
+login = HeadlessLogin(cdp_port=9333)
+ws = WsRuntime(cdp_port=9333, token_provider=ProveedorNavegador(login))
+ws.start()
+login.login()            # -> {"state": "ready"} o {"state": "mfa_required"}
+login.submit_mfa("123456")
+```
+
 ## HTTP local opcional
 
 `TosHttpServer` puede exponer metodos directos por HTTP:
@@ -143,10 +222,17 @@ CDP guarda el token y la orden continua.
 - `POST /buy`: compra directa por WebSocket.
 - `POST /sell`: venta directa por WebSocket.
 - `POST /auto_exit`: revision de salida automatica por porcentaje.
+- `POST /bracket`: entrada + take profit + stop loss (1st trgs OCO). Cuerpo:
+  `symbol`, `quantity`, `entry_type`, `entry_limit`, `take_profit`,
+  `stop_loss`, `tif`, `submit`; para opciones ademas `expiration`,
+  `direction`, `strike`.
+- `POST /cancel_order`: `{"order_id": ...}`.
 - `GET /broker_positions`: posiciones OPTION abiertas del broker.
 - `GET /day_summary`: resumen del dia y P/L disponible/calculado.
 - `GET /ws_status`: estado del token.
 - `GET /logs`: ultimas lineas de log.
+- `GET /login_status`, `POST /login`, `POST /mfa`, `GET /login_screenshot`:
+  login headless en un servidor (ver arriba).
 
 Ejemplo:
 
@@ -183,6 +269,7 @@ day_summary()
 | `tos.server` | opcional | Receptor HTTP local con `/buy` y `/sell` |
 | `tos.client` | opcional | Cliente HTTP para enviar compras/ventas al receptor local |
 | `tos.token_store` / `tos.ws_token_capture` | recomendado | Persistencia y captura del token de sesion |
+| `tos.headless_login` + `tos.servicio` | opcional `[server]` | Login en un servidor con Chromium headless, MFA por HTTP y servicio listo para ejecutar |
 | `tos.automation` + `tos.tos_scripts` | opcional `[qt]` | Auto-login Paper Money en un `QWebEnginePage` creado por el host |
 | `tos.alerts` | legado | Gestor de alertas y salidas por prima; no usar en integraciones v1.2 nuevas |
 | `tos.hooks` | legado | Hooks de precios/contratos usados por el gestor anterior |

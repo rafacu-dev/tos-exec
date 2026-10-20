@@ -251,6 +251,86 @@ def login_script(username: str, password: str) -> str:
 """
 
 
+_MFA_TEXT = r"multi-factor|mfa|verification code|security code|authenticator|one-time|verify your identity|confirm your identity|enter the code|we sent"
+
+
+def mfa_state_script() -> str:
+    """Lee si la pagina pide MFA y si ya hay un campo para el codigo.
+
+    Selectores por patron (no verificados contra el DOM real de Schwab):
+    revisar con una captura si Schwab cambia la pantalla de verificacion.
+    """
+    return r"""
+(async () => {
+  const steps = [];
+""" + _COMMON + r"""
+  const text = pageText();
+  const mfa = new RegExp(""" + json.dumps(_MFA_TEXT) + r""", "i").test(text);
+  const codeInput = deepQueryAll("input").filter(visible).find((i) =>
+    i.autocomplete === "one-time-code" || i.inputMode === "numeric"
+    || /code|otp|passcode|security|verification|pin/i.test(labelOf(i))) || null;
+  return { ok: true, state: mfa ? "MFA" : "NO_MFA", mfa, codeInput: Boolean(codeInput),
+           textSample: text.slice(0, 400), steps };
+})();
+"""
+
+
+def mfa_request_code_script() -> str:
+    """Si Schwab pide elegir como recibir el codigo, pulsa enviar (SMS/texto
+    primero). No hace nada si ya hay un campo para el codigo."""
+    return r"""
+(async () => {
+  const steps = [];
+""" + _COMMON + r"""
+  const inputs = deepQueryAll("input").filter(visible);
+  const hasCode = inputs.some((i) => i.autocomplete === "one-time-code" || i.inputMode === "numeric"
+    || /code|otp|passcode|security|verification|pin/i.test(labelOf(i)));
+  if (hasCode) return { ok: true, state: "CODE_INPUT_READY", steps };
+  const buttons = deepQueryAll("button, input[type='submit'], input[type='button'], [role='button'], sdps-button, a, label")
+    .filter(visible).filter((b) => !/cancel|back|help|forgot|call me|phone call/i.test(labelOf(b)));
+  const pick = buttons.find((b) => /text|sms/i.test(labelOf(b)))
+    || buttons.find((b) => /send( me)?( a)? code|send code|get code/i.test(labelOf(b)))
+    || buttons.find((b) => /continue|next/i.test(labelOf(b)));
+  if (!pick) return { ok: false, state: "MFA_OPTIONS_NOT_FOUND", steps };
+  click(pick, "MFA: " + labelOf(pick).slice(0, 60));
+  await sleep(1500);
+  const next = deepQueryAll("button, input[type='submit'], [role='button'], sdps-button").filter(visible)
+    .find((b) => /send|continue|next/i.test(labelOf(b)) && !/cancel|back/i.test(labelOf(b)));
+  const stillNoCode = !deepQueryAll("input").filter(visible).some((i) => i.autocomplete === "one-time-code"
+    || i.inputMode === "numeric" || /code|otp|passcode|security|verification|pin/i.test(labelOf(i)));
+  if (next && stillNoCode) { click(next, "MFA: " + labelOf(next).slice(0, 60)); await sleep(1500); }
+  return { ok: true, state: "CODE_REQUESTED", steps };
+})();
+"""
+
+
+def mfa_submit_script(code: str) -> str:
+    """Escribe el codigo MFA, marca 'recordar este dispositivo' si existe y
+    envia. El codigo lo aporta el usuario; nunca se intenta saltar el MFA."""
+    c = json.dumps(str(code or "").strip())
+    return r"""
+(async () => {
+  const code = """ + c + r""";
+  const steps = [];
+""" + _COMMON + r"""
+  const inputs = deepQueryAll("input").filter(visible);
+  const input = inputs.find((i) => i.autocomplete === "one-time-code")
+    || inputs.find((i) => i.inputMode === "numeric")
+    || inputs.find((i) => /code|otp|passcode|security|verification|pin/i.test(labelOf(i)) && i.type !== "checkbox")
+    || inputs.find((i) => ["tel", "number"].includes(i.type));
+  if (!input) return { ok: false, state: "MFA_INPUT_NOT_FOUND", detail: "No encontre el campo del codigo.", steps };
+  setValue(input, code); steps.push("Codigo MFA escrito"); await sleep(400);
+  const remember = deepQueryAll("input[type='checkbox']").find((cb) =>
+    /remember|trust|don.?t ask|recordar|confiar/i.test(labelOf(cb) + " " + labelOf(cb.closest("label") || cb.parentElement)));
+  if (remember && !remember.checked) { click(remember, "Recordar dispositivo"); await sleep(200); }
+  const submit = deepQueryAll("button, input[type='submit'], [role='button'], sdps-button").filter(visible)
+    .find((b) => /continue|verify|submit|confirm|log\s*in|sign\s*in/i.test(labelOf(b)) && !/cancel|back|resend/i.test(labelOf(b)));
+  if (submit) click(submit, "Enviar codigo MFA"); else { pressEnter(input); steps.push("Enter codigo"); }
+  return { ok: true, state: "MFA_SUBMITTED", steps };
+})();
+"""
+
+
 def option_order_script(symbol: str, side: str, strike: float,
                         expiration: str, quantity: int,
                         max_investment: float, submit: bool,

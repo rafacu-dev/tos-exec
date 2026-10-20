@@ -308,6 +308,52 @@ def submit_result(submit_body: dict | None) -> dict:
     }
 
 
+BRACKET_MARKER = "FIRST_TRIGGERS_OCO"
+ENTRY_ORDER_TYPES = ("MARKET", "LIMIT")
+ORDER_TIFS = ("DAY", "GTC")
+
+
+def validate_bracket(quantity: int, take_profit: float, stop_loss: float,
+                     entry_type: str = "LIMIT", entry_limit=None,
+                     tif: str = "DAY") -> None:
+    """Rechaza un bracket incoherente ANTES de que salga ningún frame.
+
+    Solo entradas de compra (quantity>0): las salidas venden lo mismo que la
+    entrada compró, así que nunca dejan la cuenta en corto.
+    """
+    if int(quantity) <= 0:
+        raise ValueError("bracket: quantity debe ser > 0 (solo entradas de compra)")
+    if entry_type not in ENTRY_ORDER_TYPES:
+        raise ValueError(f"bracket: entry_type debe ser uno de {ENTRY_ORDER_TYPES}")
+    if tif not in ORDER_TIFS:
+        raise ValueError(f"bracket: tif debe ser uno de {ORDER_TIFS}")
+    tp, sl = float(take_profit), float(stop_loss)
+    if tp <= 0 or sl <= 0:
+        raise ValueError("bracket: take_profit y stop_loss deben ser > 0")
+    if sl >= tp:
+        raise ValueError("bracket: stop_loss debe ser menor que take_profit")
+    if entry_type == "LIMIT":
+        if entry_limit is None:
+            raise ValueError("bracket: entry_limit es obligatorio con entry_type LIMIT")
+        entry = float(entry_limit)
+        if not sl < entry < tp:
+            raise ValueError("bracket: se requiere stop_loss < entry_limit < take_profit")
+
+
+def bracket_order_ids(submit_body: dict | None) -> dict:
+    """``orderId`` de cada pata del bracket según ``/orders/<i>/orderId``.
+
+    Devuelve ``{"entry", "take_profit", "stop_loss"}``; una pata sin id queda
+    en None. Cancelar ``entry`` cancela también las salidas pendientes.
+    """
+    ids: dict[int, object] = {}
+    for p in (submit_body or {}).get("patches", []):
+        m = re.fullmatch(r"/orders/(\d+)/orderId", str(p.get("path", "")))
+        if p.get("op") == "replace" and m and p.get("value") not in (None, 0, "0", ""):
+            ids[int(m.group(1))] = p.get("value")
+    return {"entry": ids.get(0), "take_profit": ids.get(1), "stop_loss": ids.get(2)}
+
+
 def option_symbol(root: str, expiration: str, side: str, strike: float) -> str:
     """.GOOG260626P335  ← root, exp YYYY-MM-DD, CALL/PUT, strike."""
     y, m, d = expiration.split("-")
@@ -434,6 +480,68 @@ class TosWsClient:
             "SUBMIT", "EDIT_ORDER", account, sym, quantity, order_type, limit_price, 0), req_id=rid, ver=0)
         res = submit_result(sent.get("body"))
         return {"stage": "submitted", "ok": res["ok"], "order_id": res["order_id"], "body": sent.get("body")}
+
+    # --- bracket: entrada + take profit + stop loss (1st trgs OCO) ---
+    @staticmethod
+    def _bracket_params(action: str, account: str, sym: str, quantity: int,
+                        take_profit: float, stop_loss: float,
+                        entry_type: str = "LIMIT", entry_limit=None,
+                        tif: str = "DAY") -> dict:
+        """Frame ``place_order`` con marker FIRST_TRIGGERS_OCO.
+
+        Orden fija de ``orders``: entrada, take profit (LIMIT), stop loss
+        (STOP). Ver WS_PROTOCOL.md y protocol_fixtures/bracket_oco_*.json.
+        """
+        qty = int(quantity)
+        entry = {"tif": tif, "orderType": entry_type, "requestType": "EDIT_ORDER",
+                 "legs": [{"symbol": sym, "quantity": qty}], "tag": "TOSWeb"}
+        if entry_type == "LIMIT":
+            entry["limitPrice"] = round(float(entry_limit), 2)
+        target = {"tif": tif, "orderType": "LIMIT", "requestType": "EDIT_ORDER",
+                  "limitPrice": round(float(take_profit), 2),
+                  "legs": [{"symbol": sym, "quantity": -qty}], "tag": "TOSWeb"}
+        stop = {"tif": tif, "orderType": "STOP", "requestType": "EDIT_ORDER",
+                "stopPrice": round(float(stop_loss), 2),
+                "legs": [{"symbol": sym, "quantity": -qty}], "tag": "TOSWeb"}
+        return {"action": action, "accountCode": account, "marker": BRACKET_MARKER,
+                "orders": [entry, target, stop]}
+
+    async def place_bracket_order(self, account: str, sym: str, quantity: int,
+                                  take_profit: float, stop_loss: float,
+                                  entry_type: str = "LIMIT", entry_limit=None,
+                                  tif: str = "DAY", submit: bool = False) -> dict:
+        """CONFIRM → SUBMIT de un bracket. submit=False solo hace el review.
+
+        Devuelve la traza de cada paso y los ``order_ids`` de las tres patas.
+        Igual que ``order_full``: un fallo de transporte tras enviar SUBMIT no
+        prueba rechazo y se marca como ``submission_may_have_occurred``.
+        """
+        validate_bracket(quantity, take_profit, stop_loss, entry_type, entry_limit, tif)
+        rid = f"update-draft-order-{sym}"
+
+        def params(action):
+            return self._bracket_params(action, account, sym, quantity, take_profit,
+                                        stop_loss, entry_type, entry_limit, tif)
+
+        confirm = await self._request("place_order", params("CONFIRM"), req_id=rid)
+        trace = {"confirm": confirm.get("body")}
+        if not submit:
+            return trace
+        try:
+            sent = await self._request("place_order", params("SUBMIT"), req_id=rid)
+            trace["submit"] = sent.get("body")
+        except Exception as exc:
+            trace["submit"] = None
+            trace["submit_error"] = f"{type(exc).__name__}: {exc}"
+            trace["submission_may_have_occurred"] = True
+        trace["order_ids"] = bracket_order_ids(trace["submit"])
+        return trace
+
+    async def cancel_order(self, order_id) -> dict:
+        """Cancela una orden. Con la entrada de un bracket cancela las 3 patas."""
+        r = await self._request("cancel_order", {"orderId": int(order_id)},
+                                req_id=f"cancel-{int(order_id)}")
+        return r.get("body") or {}
 
     async def positions(self, account: str, fields=("QUANTITY",)) -> list[dict]:
         r = await self._request("positions", {"account": account, "fields": list(fields)},

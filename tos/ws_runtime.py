@@ -20,9 +20,11 @@ from .ws_client import LIVE_WS, PAPER_WS
 from tos import token_store, ws_token_capture
 from tos.ws_client import (
     TosWsClient,
+    submit_result,
     canonical_option_symbol,
     option_symbol,
     position_quantity,
+    validate_bracket,
     position_quantity_value,
     position_symbol,
     position_values,
@@ -341,6 +343,46 @@ class WsRuntime:
                                  order_type=order_type, limit_price=limit_price,
                                  submit=submit, timeout=timeout)
 
+    def place_bracket(self, symbol: str, quantity: int, take_profit: float,
+                      stop_loss: float, entry_type: str = "LIMIT", entry_limit=None,
+                      tif: str = "DAY", submit: bool = True,
+                      timeout: float = 40) -> dict:
+        """Entrada de compra + take profit (LIMIT) + stop loss (STOP) en una
+        sola orden 1st-trgs-OCO de TOS.
+
+        `symbol` es el símbolo TOS tal cual (acción ``F`` u opción
+        ``.SPY260715P755``). Las salidas solo se activan si la entrada se
+        llena y se cancelan entre sí. Valida precios antes de conectar.
+        """
+        entry_type, tif = str(entry_type).upper(), str(tif).upper()
+        validate_bracket(quantity, take_profit, stop_loss, entry_type, entry_limit, tif)
+        self._resolver_enrutado()
+        self._ensure_token()
+        fut = asyncio.run_coroutine_threadsafe(
+            self._bracket(symbol, int(quantity), take_profit, stop_loss,
+                          entry_type, entry_limit, tif, submit),
+            self.loop)
+        return fut.result(timeout=timeout)
+
+    def bracket_option(self, root: str, expiration: str, side: str, strike: float,
+                       quantity: int, take_profit: float, stop_loss: float,
+                       entry_type: str = "LIMIT", entry_limit=None,
+                       tif: str = "DAY", submit: bool = True,
+                       timeout: float = 40) -> dict:
+        """`place_bracket` para un contrato de opción (precios por contrato)."""
+        return self.place_bracket(option_symbol(root, expiration, side, strike),
+                                  quantity, take_profit, stop_loss,
+                                  entry_type=entry_type, entry_limit=entry_limit,
+                                  tif=tif, submit=submit, timeout=timeout)
+
+    def cancel_order(self, order_id, timeout: float = 25) -> dict:
+        """Cancela una orden por id. Con el id de la entrada de un bracket
+        cancela también sus salidas pendientes."""
+        self._resolver_enrutado()
+        self._ensure_token()
+        fut = asyncio.run_coroutine_threadsafe(self._cancel(order_id), self.loop)
+        return fut.result(timeout=timeout)
+
     def list_accounts(self, timeout: float = 25) -> list[dict]:
         """Cuentas visibles con el token actual, para poder ELEGIR una."""
         self._ensure_token()
@@ -497,6 +539,68 @@ class WsRuntime:
             return await c.positions(account, fields)
         finally:
             await c.close()
+
+    async def _authed_client(self) -> tuple[TosWsClient, str]:
+        """Cliente conectado y autenticado, con la cuenta resuelta.
+        Quien llama debe cerrarlo."""
+        d = token_store.valid(self.max_hours)
+        if not d:
+            raise RuntimeError("sin token válido — haz login en el webview")
+        c = TosWsClient(self.ws_url)
+        try:
+            await c.connect()
+            body = await c.login_token(d["token"])
+            if not c.authenticated:
+                raise RuntimeError(f"login WS rechazado: {body.get('authenticationStatus')}")
+            account = self.account or d.get("account_code")
+            if not account:
+                await c.accounts()
+                account = c.account_code
+            if not account:
+                raise RuntimeError("sin accountCode disponible")
+            return c, account
+        except Exception:
+            await c.close()
+            raise
+
+    async def _bracket(self, sym, quantity, take_profit, stop_loss,
+                       entry_type, entry_limit, tif, submit):
+        c, account = await self._authed_client()
+        try:
+            trace = await c.place_bracket_order(
+                account, sym, quantity, take_profit, stop_loss,
+                entry_type=entry_type, entry_limit=entry_limit, tif=tif,
+                submit=submit)
+        finally:
+            await c.close()
+        order_ids = trace.get("order_ids") or {}
+        if not submit:
+            state, accepted = "preview", True
+        elif trace.get("submit_error"):
+            state, accepted = "unknown_submit_transport_error", False
+        elif order_ids.get("entry"):
+            state, accepted = "accepted", True
+        else:
+            # Igual que en órdenes simples: sin orderId no se afirma rechazo.
+            sr = submit_result(trace.get("submit"))
+            state, accepted = sr["submission_state"], False
+        return {
+            "ok": accepted, "accepted": accepted, "symbol": sym,
+            "stage": "submitted" if submit else "confirmed",
+            "submission_state": state,
+            "submission_may_have_occurred": bool(submit and state != "rejected"),
+            "order_id": order_ids.get("entry"), "order_ids": order_ids,
+            "error": trace.get("submit_error"),
+            "trace": trace,
+        }
+
+    async def _cancel(self, order_id):
+        c, _account = await self._authed_client()
+        try:
+            body = await c.cancel_order(order_id)
+        finally:
+            await c.close()
+        return {"ok": True, "order_id": int(order_id), "body": body}
 
     async def _auto_exit_percent(self, take_profit_pct, stop_loss_pct, submit, dry_run):
         d = token_store.valid(self.max_hours)
